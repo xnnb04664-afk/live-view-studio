@@ -1,6 +1,6 @@
 # 取景台 · Live View Studio
 
-[中文](#中文) · [English](#english) · [Project website](https://xnnb04664-afk.github.io/live-view-studio/)
+[中文](#中文) · [English](#english) · [Project website](https://xnnb04664-afk.github.io/live-view-studio/) · [下载 Windows 安装包](https://github.com/xnnb04664-afk/live-view-studio/releases/latest/download/LiveViewStudio-Setup-0.1.2.exe) · [Download installer](https://github.com/xnnb04664-afk/live-view-studio/releases/latest/download/LiveViewStudio-Setup-0.1.2.exe)
 
 Windows 摄像头取景与拍照桌面应用。实时预览、镜像、缩放和平移都在本机完成；可选手机收图通道会在上传前使用 AES-256-GCM 加密照片。
 
@@ -41,7 +41,7 @@ $env:GITHUB_TRANSFER_TOKEN = "your-fine-grained-token"
 npm run dev
 ```
 
-照片先保存在 `D:\照片传送`。GitHub 中转仅保存 AES-256-GCM 加密后的照片；请自行管理仓库访问权限和令牌。旧 Cloudflare 通道迁移是可选配置，默认不会连接任何个人服务。
+照片默认保存在 `D:\照片传送`，也可在桌面应用设置中选择其他文件夹；更改位置不会移动已有照片。启用手机收图后，保存目录中的图片会自动同步。GitHub 中转仅保存 AES-256-GCM 加密后的照片；请自行管理仓库访问权限和令牌。旧 Cloudflare 通道迁移是可选配置，默认不会连接任何个人服务。
 
 ### 仓库范围
 
@@ -80,7 +80,7 @@ $env:GITHUB_TRANSFER_TOKEN = "your-fine-grained-token"
 npm run dev
 ```
 
-Photos are saved locally to `D:\照片传送` first. The GitHub relay stores AES-256-GCM-encrypted photos only. You remain responsible for repository access and token management. Legacy Cloudflare migration is optional and no personal service endpoint is enabled by default.
+Photos are saved locally to `D:\照片传送` by default; choose another folder in the desktop app settings if you prefer. Changing the location does not move existing photos. When phone transfer is enabled, images in the selected folder are synced automatically. The GitHub relay stores AES-256-GCM-encrypted photos only. You remain responsible for repository access and token management. Legacy Cloudflare migration is optional and no personal service endpoint is enabled by default.
 
 ### Repository scope
 

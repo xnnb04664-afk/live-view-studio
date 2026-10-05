@@ -6,8 +6,8 @@ from playwright.sync_api import sync_playwright
 
 
 ROOT = Path(__file__).resolve().parents[1]
-APP_URL = "http://127.0.0.1:51231/"
-SITE_URL = "http://127.0.0.1:51232/"
+APP_URL = "http://127.0.0.1:54321/"
+SITE_URL = "http://127.0.0.1:54322/"
 CJK = re.compile(r"[\u3400-\u9fff]+")
 
 
@@ -36,14 +36,46 @@ with sync_playwright() as playwright:
         removeEventListener: () => {}
       }});
     """)
+    app.add_init_script("""
+      const directoryKey = 'live-view-studio:test-photo-directory';
+      const defaultDirectory = 'C:/Users/Playwright/Pictures/Default';
+      let isFullscreen = false;
+      window.desktop = {
+        window: {
+          getState: async () => ({ isFullscreen, isMaximized: false, isAlwaysOnTop: false }),
+          setFullscreen: async (enabled) => { isFullscreen = Boolean(enabled); return isFullscreen; }
+        },
+        getSnapshotDirectory: async () => localStorage.getItem(directoryKey) || defaultDirectory,
+        chooseSnapshotDirectory: async () => {
+          const directory = 'C:/Users/Playwright/Pictures/Chosen';
+          localStorage.setItem(directoryKey, directory);
+          return directory;
+        },
+        resetSnapshotDirectory: async () => {
+          localStorage.removeItem(directoryKey);
+          return defaultDirectory;
+        }
+      };
+    """)
     app.goto(APP_URL, wait_until="networkidle")
     app.wait_for_timeout(750)
     if app.locator("h1").count() == 0:
         print("APP_DEBUG", app.locator("body").inner_text(), app_errors, app.content()[:1200])
     app.get_by_role("heading", name="取景台").wait_for()
     assert app.locator("html").get_attribute("lang") == "zh-CN"
+    app.locator(".dock-action-button").nth(1).click()
+    app.locator(".app-shell.immersive-mode").wait_for()
+    assert app.locator(".control-panel.action-panel").evaluate("element => getComputedStyle(element).display") == "none"
+    app.keyboard.press("Escape")
+    app.locator(".app-shell:not(.immersive-mode)").wait_for()
+    assert app.locator(".control-panel.action-panel").is_visible()
     app.locator(".settings-trigger").click()
     dialog = app.get_by_role("dialog")
+    directory_path = app.get_by_test_id("snapshot-directory-path")
+    app.wait_for_function("() => document.querySelector('[data-testid=\"snapshot-directory-path\"]')?.textContent?.trim() === 'C:/Users/Playwright/Pictures/Default'")
+    dialog.get_by_role("button", name="选择文件夹").click()
+    app.wait_for_function("() => document.querySelector('[data-testid=\"snapshot-directory-path\"]')?.textContent?.trim() === 'C:/Users/Playwright/Pictures/Chosen'")
+    assert directory_path.inner_text() == "C:/Users/Playwright/Pictures/Chosen"
     dialog.get_by_label("界面语言").select_option("en-US")
     app.get_by_role("heading", name="Device and preview settings").wait_for()
     assert app.locator("html").get_attribute("lang") == "en"
@@ -57,18 +89,25 @@ with sync_playwright() as playwright:
     dialog.get_by_role("button", name="Done").click()
     app.get_by_role("button", name="Photo receiver").click()
     app.get_by_role("heading", name="Photo receiver").wait_for()
-    assert_no_cjk(app.locator("body").inner_text(), allowed=("D:\\照片传送",))
+    assert_no_cjk(app.locator("body").inner_text())
     app.get_by_role("button", name="Done").click()
     app.reload(wait_until="networkidle")
     app.get_by_role("heading", name="Live View Studio").wait_for()
     assert app.title() == "Live View Studio — Webcam Viewer for Windows"
     app.locator(".settings-trigger").click()
-    app.get_by_role("dialog").get_by_label("Interface language").select_option("zh-CN")
+    dialog = app.get_by_role("dialog")
+    app.wait_for_function("() => document.querySelector('[data-testid=\"snapshot-directory-path\"]')?.textContent?.trim() === 'C:/Users/Playwright/Pictures/Chosen'")
+    dialog.get_by_role("button", name="Reset to default").click()
+    app.wait_for_function("() => document.querySelector('[data-testid=\"snapshot-directory-path\"]')?.textContent?.trim() === 'C:/Users/Playwright/Pictures/Default'")
+    dialog.get_by_label("Interface language").select_option("zh-CN")
     app.get_by_role("heading", name="设备与取景设置").wait_for()
     assert app.locator("html").get_attribute("lang") == "zh-CN"
     app.get_by_role("button", name="完成").click()
     app.reload(wait_until="networkidle")
     app.get_by_role("heading", name="取景台").wait_for()
+    app.locator(".settings-trigger").click()
+    app.wait_for_function("() => document.querySelector('[data-testid=\"snapshot-directory-path\"]')?.textContent?.trim() === 'C:/Users/Playwright/Pictures/Default'")
+    app.get_by_role("button", name="完成").click()
     assert not app_errors, f"App browser errors: {app_errors}"
 
     site = context.new_page()
@@ -102,4 +141,4 @@ with sync_playwright() as playwright:
 
     browser.close()
 
-print("PASS: Chinese/English app switch, persistence, transfer/settings text, localized metadata, reciprocal language links, sitemap, and static pages.")
+print("PASS: Chinese/English app switch, photo-folder selection/reset persistence, transfer/settings text, localized metadata, reciprocal language links, sitemap, and static pages.")

@@ -116,7 +116,7 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px s
 .viewer-footer { display: none; }
 .video-surface { min-height: 100%; border: 0; }
 .control-panel.action-panel { position: absolute; z-index: 12; right: 0; bottom: 0; left: 0; display: flex; width: auto; max-height: 245px; flex-direction: row; align-items: stretch; gap: 28px; padding: 22px 30px 20px; border-top: 1px solid rgba(218,208,180,.1); background: linear-gradient(180deg, rgba(8,10,10,.05) 0%, rgba(9,12,11,.86) 34%, rgba(9,12,11,.98) 100%); backdrop-filter: blur(10px); }
-.app-shell.immersive-mode .control-panel.action-panel { display: flex; }
+.app-shell.immersive-mode .control-panel.action-panel { display: none; }
 .app-shell.immersive-mode .viewer-panel { padding: 0; }
 .action-panel .action-heading { flex: 0 0 142px; display: flex; flex-direction: column; justify-content: space-between; padding: 2px 0 0; }.action-panel .action-heading h2 { font-size: 20px; }.action-panel .settings-trigger { align-self: flex-start; }
 .action-panel .quick-actions { display: grid; grid-template-columns: minmax(230px, 270px) minmax(330px, 1fr) 106px; align-items: center; flex: 1; gap: 24px; min-width: 0; }.action-panel .shutter-button-large { min-height: 104px; }.action-panel .quick-zoom { min-width: 0; }.action-panel .quick-label { margin-bottom: 12px; }.action-panel .zoom-hint { margin-top: 7px; }.action-panel .quick-reset { align-self: stretch; min-height: 42px; border: 0; border-left: 1px solid rgba(218,208,180,.12); border-top: 0; border-bottom: 0; }
@@ -136,7 +136,6 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px s
 .viewer-panel { flex: 1 1 auto; height: auto; min-height: 0; }
 .video-surface { flex: 1 1 auto; height: auto; min-height: 0; }
 .control-panel.action-panel { position: relative; right: auto; bottom: auto; left: auto; flex: 0 0 clamp(205px, 26vh, 245px); max-height: none; background: #0d1110; box-shadow: 0 -12px 28px rgba(0,0,0,.2); backdrop-filter: none; }
-.app-shell.immersive-mode .control-panel.action-panel { display: flex; }
 
 @media (max-height: 650px) {
   .control-panel.action-panel { flex-basis: 205px; padding-top: 15px; padding-bottom: 13px; }.action-panel .action-heading { padding-top: 0; }.action-panel .quick-actions { gap: 14px; }.action-panel .shutter-button-large { min-height: 88px; }.pan-zone { min-height: 27px; margin-top: 7px; }
@@ -424,6 +423,16 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px s
 .dock-action-button.active { border-color: rgba(227,181,100,.4); color: var(--amber-bright); background: rgba(227,181,100,.07); }
 
 .settings-help { margin: 0 0 13px; color: #6f776e; font-size: 10px; line-height: 1.5; }
+.settings-dialog .snapshot-directory-value { display: flex; align-items: flex-start; gap: 9px; min-width: 0; padding: 11px 12px; border: 1px solid rgba(218,208,180,.12); color: #d4d0c3; background: rgba(255,255,255,.025); font-family: "DM Mono", Consolas, monospace; font-size: 11px; line-height: 1.55; }
+.settings-dialog .snapshot-directory-value svg { flex: 0 0 auto; margin-top: 1px; color: var(--amber-dim); }
+.settings-dialog .snapshot-directory-value span { min-width: 0; overflow-wrap: anywhere; }
+.settings-dialog .snapshot-directory-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 11px; }
+.settings-dialog .snapshot-directory-actions button { min-height: 34px; padding: 0 12px; border: 1px solid rgba(227,181,100,.36); color: var(--amber-bright); background: rgba(227,181,100,.07); font-size: 11px; cursor: pointer; }
+.settings-dialog .snapshot-directory-actions button:hover:not(:disabled) { border-color: var(--amber); background: rgba(227,181,100,.13); }
+.settings-dialog .snapshot-directory-actions button:focus-visible { outline: 2px solid var(--amber-bright); outline-offset: 2px; }
+.settings-dialog .snapshot-directory-actions button:disabled { opacity: .55; cursor: wait; }
+.settings-dialog .snapshot-directory-actions .snapshot-directory-reset { border-color: rgba(218,208,180,.14); color: #96998e; background: transparent; }
+.settings-dialog .snapshot-directory-actions .snapshot-directory-reset:hover:not(:disabled) { border-color: rgba(218,208,180,.32); color: #d4d0c3; }
 .dock-button-options { display: grid; grid-template-columns: 1fr 1fr; gap: 1px 12px; }
 .dock-button-option { display: flex; align-items: center; gap: 8px; min-height: 34px; color: #9da39a; font-size: 11px; cursor: pointer; }
 .dock-button-option:hover { color: var(--amber-bright); }

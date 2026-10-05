@@ -35,7 +35,7 @@ const english: Record<string, string> = {
   "把同一条密钥粘贴到手机端；手机会自动从私有仓库同步照片": "Paste the same key into the phone app. It will sync photos from your private repository.",
   "正在检查通道": "Checking transfer channel",
   "创建你的私有收图通道": "Create your private photo-transfer channel",
-  "创建后会生成一条连接密钥。桌面端会自动同步 D:\\照片传送 中的照片，GitHub 只保存密文。": "A pairing key will be created. The desktop app automatically syncs photos from D:\\照片传送; GitHub stores encrypted data only.",
+  "创建后会生成一条连接密钥。桌面端会自动同步照片保存位置中的图片，GitHub 只保存密文。": "A pairing key will be created. The desktop app automatically syncs images from the selected photo folder; GitHub stores encrypted data only.",
   "创建通道": "Create channel",
   "打开手机端收图": "Open the photo receiver on your phone",
   "两台手机可以使用同一条连接密钥": "Both phones can use the same pairing key",
@@ -54,7 +54,7 @@ const english: Record<string, string> = {
   "之后打开应用会自动轮询私有仓库": "The app will check your private repository automatically.",
   "每条密钥只使用一次，过期后可刷新": "Each key can be used once. Refresh it if it expires.",
   "AES-256-GCM 端到端加密": "End-to-end encryption with AES-256-GCM",
-  "拍摄或放入 D:\\照片传送 的照片会自动上传，手机会从 GitHub 私有仓库同步，确认后再保存到相册。": "New photos saved to D:\\照片传送 are uploaded automatically. Your phone syncs them from your private GitHub repository and saves them to its gallery after confirmation.",
+  "照片保存位置中的图片会自动上传，手机会从 GitHub 私有仓库同步，确认后再保存到相册。": "Images in the selected photo folder are uploaded automatically. Your phone syncs them from your private GitHub repository and saves them to its gallery after confirmation.",
   "已收照片": "Photos received",
   " 张照片等待发送": " photos waiting to send",
   "重试发送": "Retry uploads",
@@ -205,6 +205,15 @@ const english: Record<string, string> = {
   "语言": "Language",
   "界面语言": "Interface language",
   "应用显示": "App display",
+  "照片保存位置": "Photo save location",
+  "新拍摄的照片会保存在此处；更改位置不会移动已有照片。启用手机收图时，此文件夹内尚未同步的图片也会自动上传。": "New photos are saved here. Changing the folder won't move existing photos. With phone transfer enabled, unsynced images in this folder are also uploaded automatically.",
+  "正在读取保存位置…": "Loading photo folder…",
+  "选择文件夹": "Choose folder",
+  "打开中…": "Opening…",
+  "恢复默认": "Reset to default",
+  "照片保存位置已更新": "Photo save location updated",
+  "照片保存位置已恢复默认": "Photo save location reset to default",
+  "保存位置更改失败": "Could not change photo save location",
 };
 
 let activeLanguage: AppLanguage = "zh-CN";

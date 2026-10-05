@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, nativeImage, safeStorage, session, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeImage, safeStorage, session, shell } from "electron";
 import { execFile } from "node:child_process";
 import { createCipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -68,6 +68,10 @@ let snapshotWatcher: ReturnType<typeof fs.watch> | null = null;
 let snapshotSyncTimer: NodeJS.Timeout | null = null;
 let snapshotSyncPromise: Promise<void> | null = null;
 let snapshotSyncRequested = false;
+let snapshotDirectoryOverride: string | null = null;
+let snapshotDirectoryOverrideLoaded = false;
+let snapshotFolderSyncStarted = false;
+let snapshotFolderSyncGeneration = 0;
 const inFlightUploads = new Map<string, Promise<RemoteImage>>();
 let remoteImagesCache: { channelId: string; expiresAt: number; images: RemoteImage[] } | null = null;
 let githubTokenCache: string | null = null;
@@ -1450,8 +1454,23 @@ function scheduleSnapshotFolderSync(delayMs = 500): void {
 }
 
 async function startSnapshotFolderSync(): Promise<void> {
+  if (snapshotFolderSyncStarted) {
+    return;
+  }
+  snapshotFolderSyncStarted = true;
+  const generation = ++snapshotFolderSyncGeneration;
   const directory = getSnapshotDirectory();
-  await fs.promises.mkdir(directory, { recursive: true });
+  try {
+    await fs.promises.mkdir(directory, { recursive: true });
+  } catch (error) {
+    if (generation === snapshotFolderSyncGeneration) {
+      snapshotFolderSyncStarted = false;
+    }
+    throw error;
+  }
+  if (generation !== snapshotFolderSyncGeneration || directory !== getSnapshotDirectory()) {
+    return;
+  }
   try {
     snapshotWatcher = fs.watch(directory, { persistent: true }, (_eventType, filename) => {
       if (!filename || isSupportedImageFile(filename.toString())) {
@@ -1470,6 +1489,9 @@ async function startSnapshotFolderSync(): Promise<void> {
 }
 
 function stopSnapshotFolderSync(): void {
+  snapshotFolderSyncStarted = false;
+  snapshotFolderSyncGeneration += 1;
+  snapshotSyncRequested = false;
   if (snapshotSyncTimer) {
     clearTimeout(snapshotSyncTimer);
     snapshotSyncTimer = null;
@@ -1572,7 +1594,43 @@ function ensureMainWindow(): BrowserWindow {
 }
 
 function getSnapshotDirectory(): string {
+  if (!snapshotDirectoryOverrideLoaded) {
+    try {
+      const settings = JSON.parse(fs.readFileSync(getSnapshotDirectorySettingsPath(), "utf8")) as { directory?: unknown };
+      const directory = typeof settings.directory === "string" ? settings.directory.trim() : "";
+      snapshotDirectoryOverride = directory && path.isAbsolute(directory) ? path.normalize(directory) : null;
+    } catch {
+      snapshotDirectoryOverride = null;
+    }
+    snapshotDirectoryOverrideLoaded = true;
+  }
+
+  if (snapshotDirectoryOverride) {
+    return snapshotDirectoryOverride;
+  }
   return process.env.SNAPSHOT_DIRECTORY?.trim() || DEFAULT_SNAPSHOT_DIRECTORY;
+}
+
+function getSnapshotDirectorySettingsPath(): string {
+  return path.join(app.getPath("userData"), "photo-storage.json");
+}
+
+function persistSnapshotDirectory(directory: string | null): void {
+  const settingsPath = getSnapshotDirectorySettingsPath();
+  if (directory) {
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    fs.writeFileSync(settingsPath, JSON.stringify({ directory }, null, 2), "utf8");
+  } else {
+    try {
+      fs.unlinkSync(settingsPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+  snapshotDirectoryOverride = directory;
+  snapshotDirectoryOverrideLoaded = true;
 }
 
 function registerIpcHandlers(): void {
@@ -1634,6 +1692,38 @@ function registerIpcHandlers(): void {
     await fs.promises.writeFile(filePath, Buffer.from(base64, "base64"));
 
     return { path: filePath, directory };
+  });
+
+  ipcMain.handle("snapshot:get-directory", () => getSnapshotDirectory());
+
+  ipcMain.handle("snapshot:choose-directory", async (): Promise<string | null> => {
+    const result = await dialog.showOpenDialog(ensureMainWindow(), {
+      defaultPath: getSnapshotDirectory(),
+      properties: ["openDirectory", "createDirectory"],
+    });
+    const selectedPath = result.filePaths[0];
+    if (result.canceled || !selectedPath) {
+      return null;
+    }
+
+    const directory = path.resolve(selectedPath);
+    await fs.promises.mkdir(directory, { recursive: true });
+    await fs.promises.access(directory, fs.constants.W_OK);
+    persistSnapshotDirectory(directory);
+    stopSnapshotFolderSync();
+    void startSnapshotFolderSync().catch((error) => {
+      console.warn("Unable to watch selected photo folder", error);
+    });
+    return directory;
+  });
+
+  ipcMain.handle("snapshot:reset-directory", async (): Promise<string> => {
+    persistSnapshotDirectory(null);
+    stopSnapshotFolderSync();
+    void startSnapshotFolderSync().catch((error) => {
+      console.warn("Unable to watch default photo folder", error);
+    });
+    return getSnapshotDirectory();
   });
 
   ipcMain.handle("snapshot:open-folder", async () => {

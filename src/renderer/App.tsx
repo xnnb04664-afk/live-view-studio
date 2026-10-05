@@ -435,7 +435,7 @@ function TransferDialog({
             <div className="transfer-empty">
               <div className="transfer-empty-mark"><Icon name="cloud" size={26} /></div>
               <strong>{t("创建你的私有收图通道")}</strong>
-              <p>{t("创建后会生成一条连接密钥。桌面端会自动同步 D:\\照片传送 中的照片，GitHub 只保存密文。")}</p>
+              <p>{t("创建后会生成一条连接密钥。桌面端会自动同步照片保存位置中的图片，GitHub 只保存密文。")}</p>
               <button className="transfer-primary" type="button" onClick={onEnsure} disabled={isLoading}>{t("创建通道")}</button>
             </div>
           ) : pairingPayloads.length > 0 ? (
@@ -465,7 +465,7 @@ function TransferDialog({
             <div className="transfer-paired">
               <div className="transfer-paired-orbit"><Icon name="phone" size={30} /></div>
               <strong>{t(`已绑定 ${state?.receiverCount ?? 0} 台手机`)}</strong>
-              <span>{t("拍摄或放入 D:\\照片传送 的照片会自动上传，手机会从 GitHub 私有仓库同步，确认后再保存到相册。")}</span>
+              <span>{t("照片保存位置中的图片会自动上传，手机会从 GitHub 私有仓库同步，确认后再保存到相册。")}</span>
               <div className="transfer-paired-meta"><span>{t("已收照片")}</span><strong>{state?.imageCount ?? 0}</strong></div>
             </div>
           )}
@@ -493,6 +493,8 @@ export default function App() {
     persistAppLanguage(savedLanguage);
     return savedLanguage;
   });
+  const [snapshotDirectory, setSnapshotDirectory] = useState("D:\\照片传送");
+  const [isChangingSnapshotDirectory, setIsChangingSnapshotDirectory] = useState(false);
   const [capture, setCapture] = useState<CaptureState>(() => readStoredCaptureState());
   const captureRef = useRef(capture);
   const [stream, setStream] = useState<MediaStream | null>(null);
@@ -554,6 +556,56 @@ export default function App() {
     persistAppLanguage(nextLanguage);
     setLanguage(nextLanguage);
   };
+
+  useEffect(() => {
+    let active = true;
+    const loadSnapshotDirectory = async () => {
+      try {
+        const directory = await window.desktop?.getSnapshotDirectory();
+        if (active && directory) {
+          setSnapshotDirectory(directory);
+        }
+      } catch {
+        // Keep the default display path if the desktop settings bridge is unavailable.
+      }
+    };
+    void loadSnapshotDirectory();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const chooseSnapshotDirectory = useCallback(async () => {
+    const desktop = window.desktop;
+    if (!desktop || isChangingSnapshotDirectory) return;
+    setIsChangingSnapshotDirectory(true);
+    try {
+      const directory = await desktop.chooseSnapshotDirectory();
+      if (directory) {
+        setSnapshotDirectory(directory);
+        showToast("照片保存位置已更新");
+      }
+    } catch (error) {
+      showToast("保存位置更改失败", error instanceof Error ? error.message : undefined, "warning");
+    } finally {
+      setIsChangingSnapshotDirectory(false);
+    }
+  }, [isChangingSnapshotDirectory, showToast]);
+
+  const resetSnapshotDirectory = useCallback(async () => {
+    const desktop = window.desktop;
+    if (!desktop || isChangingSnapshotDirectory) return;
+    setIsChangingSnapshotDirectory(true);
+    try {
+      const directory = await desktop.resetSnapshotDirectory();
+      setSnapshotDirectory(directory);
+      showToast("照片保存位置已恢复默认");
+    } catch (error) {
+      showToast("保存位置更改失败", error instanceof Error ? error.message : undefined, "warning");
+    } finally {
+      setIsChangingSnapshotDirectory(false);
+    }
+  }, [isChangingSnapshotDirectory, showToast]);
 
   const refreshTransferState = useCallback(async () => {
     if (!window.desktop?.transfer) {
@@ -1607,6 +1659,18 @@ export default function App() {
                       <Icon name="chevronDown" size={15} />
                     </span>
                   </label>
+                </div>
+                <div className="setting-group snapshot-directory-setting">
+                  <div className="settings-group-title">{t("照片保存位置")}</div>
+                  <p className="settings-help">{t("新拍摄的照片会保存在此处；更改位置不会移动已有照片。启用手机收图时，此文件夹内尚未同步的图片也会自动上传。")}</p>
+                  <div className="snapshot-directory-value" data-testid="snapshot-directory-path" title={snapshotDirectory}>
+                    <Icon name="folder" size={15} />
+                    <span>{snapshotDirectory || t("正在读取保存位置…")}</span>
+                  </div>
+                  <div className="snapshot-directory-actions">
+                    <button type="button" onClick={() => void chooseSnapshotDirectory()} disabled={isChangingSnapshotDirectory}>{isChangingSnapshotDirectory ? t("打开中…") : t("选择文件夹")}</button>
+                    <button className="snapshot-directory-reset" type="button" onClick={() => void resetSnapshotDirectory()} disabled={isChangingSnapshotDirectory}>{t("恢复默认")}</button>
+                  </div>
                 </div>
                 <div className="setting-group">
                   <div className="settings-group-title">{t("画面模式")}</div>

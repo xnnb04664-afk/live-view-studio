@@ -87,6 +87,9 @@ export type DesktopBridge = {
     setAlwaysOnTop: (enabled: boolean) => Promise<boolean>;
     getState: () => Promise<{ isFullscreen: boolean; isMaximized: boolean; isAlwaysOnTop: boolean }>;
   };
+  getSnapshotDirectory: () => Promise<string>;
+  chooseSnapshotDirectory: () => Promise<string | null>;
+  resetSnapshotDirectory: () => Promise<string>;
   saveSnapshot: (dataUrl: string) => Promise<SnapshotResult>;
   openSnapshotFolder: () => Promise<void>;
   openPrivacySettings: (target: PrivacyTarget) => Promise<void>;
