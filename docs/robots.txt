@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://xnnb04664-afk.github.io/live-view-studio/sitemap.xml

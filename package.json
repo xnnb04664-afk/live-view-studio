@@ -1,0 +1,69 @@
+{
+  "name": "live-view-studio",
+  "version": "0.1.0",
+  "description": "Windows camera live view and snapshot studio",
+  "main": "dist-electron/main.js",
+  "author": "Live View Studio",
+  "license": "MIT",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"npm run dev:electron\"",
+    "dev:electron": "tsc -p tsconfig.electron.json && wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.electron.json --noEmit",
+    "build": "tsc -p tsconfig.electron.json && vite build",
+    "dist": "npm run build && electron-builder --win --x64 --config.electronDist=node_modules/electron/dist",
+    "dist:unpacked": "npm run build && electron-builder --win dir --x64 --config.electronDist=node_modules/electron/dist --config.directories.output=release-electron-unpacked",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.1.1",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "^44.5.1",
+    "electron-builder": "^26.15.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.2",
+    "wait-on": "^9.0.3"
+  },
+  "build": {
+    "appId": "com.liveviewstudio.desktop",
+    "productName": "取景台",
+    "directories": {
+      "output": "release-electron-restored"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "build/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "executableName": "LiveViewStudio",
+      "icon": "build/取景台.ico"
+    },
+    "nsis": {
+      "artifactName": "LiveViewStudio-Setup-${version}.${ext}",
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "取景台"
+    }
+  }
+}
