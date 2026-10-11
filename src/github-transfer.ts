@@ -288,8 +288,10 @@ async function githubJsonRequest<T>(
   credentials: GithubTransferCredentials,
   pathname: string,
   init: RequestInit = {},
+  query?: string,
 ): Promise<T> {
-  const response = await fetchGithub(repositoryUrl(credentials, pathname), {
+  const url = repositoryUrl(credentials, pathname) + (query ? `?${query}` : "");
+  const response = await fetchGithub(url, {
     ...init,
     headers: {
       ...githubHeaders(credentials),
@@ -463,6 +465,25 @@ export async function listGithubImages(credentials: GithubTransferCredentials): 
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
 }
 
+/** Return the committed file paths so reconciliation can detect deleted blobs. */
+export async function listGithubFilePaths(credentials: GithubTransferCredentials): Promise<Set<string>> {
+  const ref = await githubJsonRequest<GithubRefResponse>(
+    credentials,
+    `git/ref/heads/${credentials.githubBranch}`,
+  );
+  const commit = await githubJsonRequest<GithubCommitResponse>(credentials, `git/commits/${ref.object.sha}`);
+  const tree = await githubJsonRequest<{ tree?: Array<{ path: string; type: string }>; truncated?: boolean }>(
+    credentials,
+    `git/trees/${commit.tree.sha}`,
+    {},
+    "recursive=1",
+  );
+  if (tree.truncated) {
+    throw new Error("GitHub 仓库文件索引过大，暂时无法校验备份文件");
+  }
+  return new Set((tree.tree ?? []).filter((entry) => entry.type === "blob").map((entry) => entry.path));
+}
+
 /**
  * Update only the encrypted-photo manifest. The image blobs stay untouched,
  * so metadata repairs do not require downloading or re-encrypting photos.
@@ -488,35 +509,50 @@ export async function updateGithubManifestImages(
   });
 }
 
+export type GithubUploadOptions = {
+  restoreImageBlob?: boolean;
+  restorePreviewBlob?: boolean;
+};
+
 export async function uploadGithubImage(
   credentials: GithubTransferCredentials,
   image: RemoteImage,
   encrypted: Buffer,
   preview?: GithubPreviewUpload,
+  options: GithubUploadOptions = {},
 ): Promise<RemoteImage> {
   return await withGithubWriteLock(credentials, async () => {
     const manifest = await readGithubManifest(credentials);
     const existing = manifest.images.find((item) => item.id === image.id);
-    const samePhoto = Boolean(
-      existing
-      && existing.sha256 === image.sha256
-      && existing.plainSize === image.plainSize,
-    );
+    const samePhoto = Boolean(existing
+      && (!existing.sha256 || existing.sha256 === image.sha256)
+      && (existing.plainSize === undefined || existing.plainSize === image.plainSize));
     if (existing && !samePhoto) {
       throw new Error("GitHub 清单中相同照片编号对应了不同内容");
     }
-    if (existing && samePhoto && (!preview || existing.previewNonce)) {
+    const needsMetadataRepair = Boolean(existing && (!existing.sha256 || existing.plainSize === undefined || !existing.storagePath));
+    if (
+      existing
+      && samePhoto
+      && !needsMetadataRepair
+      && !options.restoreImageBlob
+      && !options.restorePreviewBlob
+      && (!preview || existing.previewNonce)
+    ) {
       return existing;
     }
 
     const imagePath = githubImagePath(credentials, image.id);
-    if (!existing) {
+    if (!existing || options.restoreImageBlob) {
+      if (encrypted.length === 0) {
+        throw new Error(`GitHub 备用照片 ${image.id} 缺少原图密文`);
+      }
       await ensureGithubFileContent(
         credentials,
         imagePath,
         encrypted,
-        `Add encrypted image ${image.id}`,
-        false,
+        `${existing ? "Repair" : "Add"} encrypted image ${image.id}`,
+        Boolean(options.restoreImageBlob),
       );
     }
 
@@ -531,6 +567,9 @@ export async function uploadGithubImage(
         `Add encrypted preview ${image.id}`,
         true,
       );
+    }
+    if (options.restorePreviewBlob && !preview) {
+      throw new Error(`GitHub 备用照片 ${image.id} 缺少预览图密文`);
     }
 
     const nextImage: RemoteImage = {
@@ -550,7 +589,8 @@ export async function uploadGithubImage(
       existing ? `Add encrypted preview metadata ${image.id}` : `Update photo manifest ${image.id}`,
       (currentImages) => {
         const current = currentImages.find((item) => item.id === image.id);
-        if (current && (current.sha256 !== image.sha256 || current.plainSize !== image.plainSize)) {
+        if (current && ((current.sha256 && current.sha256 !== image.sha256)
+          || (current.plainSize !== undefined && current.plainSize !== image.plainSize))) {
           throw new Error("GitHub 清单中相同照片编号对应了不同内容");
         }
         return [{ ...(current ?? {}), ...nextImage }, ...currentImages.filter((item) => item.id !== image.id)];

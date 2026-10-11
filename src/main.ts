@@ -1,20 +1,20 @@
 import { app, BrowserWindow, dialog, ipcMain, nativeImage, safeStorage, session, shell } from "electron";
 import { execFile } from "node:child_process";
-import { createCipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 
 import {
-  downloadGithubImage,
   githubPreviewPath,
   githubImagePath,
+  listGithubFilePaths,
   listGithubImages,
   readGithubManifest,
   updateGithubManifestImages,
-  uploadGithubImagesBatch,
   uploadGithubImage,
   uploadGithubPreviewsBatch,
+  type GithubManifest,
   type GithubPreviewUpload,
   type GithubTransferCredentials,
 } from "./github-transfer";
@@ -31,10 +31,10 @@ const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
 const OPEN_DEVTOOLS = process.env.OPEN_DEVTOOLS === "1";
 const START_FULLSCREEN = process.env.START_FULLSCREEN === "1";
 const TRANSFER_API_BASE_URL = (process.env.TRANSFER_API_BASE_URL ?? "").replace(/\/+$/, "");
-const LEGACY_TRANSFER_API_BASE_URL = (process.env.TRANSFER_API_BASE_URL ?? "").replace(/\/+$/, "");
 const GITHUB_TRANSFER_OWNER = (process.env.GITHUB_TRANSFER_OWNER ?? "").trim();
 const GITHUB_TRANSFER_REPO = (process.env.GITHUB_TRANSFER_REPO ?? "").trim();
 const GITHUB_TRANSFER_BRANCH = (process.env.GITHUB_TRANSFER_BRANCH ?? "main").trim();
+const GITHUB_TRANSFER_READ_TOKEN = (process.env.GITHUB_TRANSFER_READ_TOKEN ?? "").trim();
 const TRANSFER_PROTOCOL_VERSION = "1";
 const MAX_TRANSFER_BYTES = 50 * 1024 * 1024;
 const TRANSFER_MAX_REQUEST_ATTEMPTS = 4;
@@ -76,9 +76,19 @@ const inFlightUploads = new Map<string, Promise<RemoteImage>>();
 let remoteImagesCache: { channelId: string; expiresAt: number; images: RemoteImage[] } | null = null;
 let githubTokenCache: string | null = null;
 let githubPreviewRepairScheduledFor: string | null = null;
+let githubBackupManifestCache: { channelId: string; expiresAt: number; manifest: GithubManifest } | null = null;
+let transferChannelSetupPromise: Promise<TransferChannelState> | null = null;
 let pendingUploadRetryTimer: NodeJS.Timeout | null = null;
 let pendingUploadRetryDueAt = 0;
 let pendingUploadRetryPromise: Promise<TransferRetryResult> | null = null;
+let pendingGithubBackupRetryTimer: NodeJS.Timeout | null = null;
+let pendingGithubBackupRetryDueAt = 0;
+let pendingGithubBackupRetryPromise: Promise<GithubBackupRetryResult> | null = null;
+let githubBackupQueueWritePromise: Promise<void> = Promise.resolve();
+let githubBackupReconciliationPending = false;
+let githubBackupReconciliationAttempts = 0;
+let githubBackupLastError: string | undefined;
+let legacyGithubMigrationPromise: Promise<GithubTransferCredentials> | null = null;
 let backgroundStartupTimer: NodeJS.Timeout | null = null;
 let isQuitting = false;
 
@@ -107,10 +117,17 @@ if (!hasSingleInstanceLock) {
 
 type CloudflareTransferCredentials = {
   mode?: "cloudflare";
+  api?: string;
   channelId: string;
   ownerToken: string;
   roomKey: string;
   createdAt: string;
+  initialized?: boolean;
+  migrationSourceGithub?: GithubTransferCredentials;
+};
+
+type TransferServerBootstrapConfig = {
+  api: string;
 };
 
 type TransferCredentials = CloudflareTransferCredentials | GithubTransferCredentials;
@@ -140,20 +157,50 @@ type UploadedFileRecord = {
 
 type UploadedFileManifest = Record<string, UploadedFileRecord>;
 
-type ChannelStateResponse = {
+type PendingGithubBackup = {
   channelId: string;
-  paired: boolean;
-  receiverCount?: number;
-  maxReceivers?: number;
-  receiverOnline: boolean;
-  imageCount: number;
-  pairingToken?: string;
-  pairingTokens?: string[];
-  pairingExpiresAt?: string;
+  image: RemoteImage;
+  hasImageBlob?: boolean;
+  hasPreview: boolean;
+  repairImageBlob?: boolean;
+  repairPreviewBlob?: boolean;
+  revision?: string;
+  queuedAt: string;
+  attemptCount?: number;
+  lastAttemptAt?: string;
+  lastError?: string;
+};
+
+type GithubBackupRetryResult = {
+  sent: number;
+  failed: number;
+  remaining: number;
+  lastError?: string;
 };
 
 function getTransferCredentialsPath(): string {
   return path.join(app.getPath("userData"), "transfer-channel.json");
+}
+
+function getTransferServerBootstrapPath(): string {
+  return path.join(app.getPath("userData"), "transfer-server-bootstrap.json");
+}
+
+function readTransferServerBootstrapConfig(): TransferServerBootstrapConfig | null {
+  try {
+    const value = JSON.parse(fs.readFileSync(getTransferServerBootstrapPath(), "utf8")) as Partial<TransferServerBootstrapConfig>;
+    const api = typeof value.api === "string" ? value.api.replace(/\/+$/, "") : "";
+    if (!api.startsWith("https://")) {
+      return null;
+    }
+    return { api };
+  } catch {
+    return null;
+  }
+}
+
+function transferApiBaseUrl(credentials?: CloudflareTransferCredentials): string {
+  return (credentials?.api || readTransferServerBootstrapConfig()?.api || TRANSFER_API_BASE_URL).replace(/\/+$/, "");
 }
 
 function getTransferQueuePath(): string {
@@ -162,6 +209,25 @@ function getTransferQueuePath(): string {
 
 function getUploadedFileManifestPath(): string {
   return path.join(app.getPath("userData"), "transfer-uploaded-files.json");
+}
+
+function getGithubCredentialsBackupPath(): string {
+  return path.join(app.getPath("userData"), "transfer-channel-github-backup.json");
+}
+
+function getGithubBackupQueuePath(): string {
+  return path.join(app.getPath("userData"), "transfer-github-backup-queue.json");
+}
+
+function getGithubBackupObjectsDirectory(): string {
+  return path.join(app.getPath("userData"), "transfer-github-backup-objects");
+}
+
+function getGithubBackupObjectPath(imageId: string, preview = false): string {
+  if (!/^[A-Za-z0-9-]{1,128}$/u.test(imageId)) {
+    throw new Error("GitHub 备份照片编号无效");
+  }
+  return path.join(getGithubBackupObjectsDirectory(), `${imageId}${preview ? ".preview" : ""}.bin`);
 }
 
 function normalizeFilePath(filePath: string): string {
@@ -226,6 +292,18 @@ function createGithubPreviewUpload(
   credentials: GithubTransferCredentials,
   imageId: string,
 ): GithubPreviewUpload | null {
+  const preview = createEncryptedPreviewUpload(filePath, credentials.channelId, credentials.roomKey, imageId);
+  return preview ? { ...preview, storagePath: githubPreviewPath(credentials, imageId) } : null;
+}
+
+type EncryptedPreviewUpload = Omit<GithubPreviewUpload, "storagePath">;
+
+function createEncryptedPreviewUpload(
+  filePath: string,
+  channelId: string,
+  roomKey: string,
+  imageId: string,
+): EncryptedPreviewUpload | null {
   try {
     const source = nativeImage.createFromPath(filePath);
     if (source.isEmpty()) {
@@ -249,8 +327,8 @@ function createGithubPreviewUpload(
     }
 
     const nonce = randomBytes(12);
-    const key = decodeBase64Url(credentials.roomKey);
-    const aad = Buffer.from(`${credentials.channelId}:${imageId}:${TRANSFER_PROTOCOL_VERSION}:preview`, "utf8");
+    const key = decodeBase64Url(roomKey);
+    const aad = Buffer.from(`${channelId}:${imageId}:${TRANSFER_PROTOCOL_VERSION}:preview`, "utf8");
     const cipher = createCipheriv("aes-256-gcm", key, nonce);
     cipher.setAAD(aad);
     const encrypted = Buffer.concat([cipher.update(plain), cipher.final(), cipher.getAuthTag()]);
@@ -260,7 +338,6 @@ function createGithubPreviewUpload(
       sizeBytes: encrypted.length,
       mimeType: "image/jpeg",
       plainSize: plain.length,
-      storagePath: githubPreviewPath(credentials, imageId),
     };
   } catch (error) {
     console.warn("Unable to create encrypted photo preview", filePath, error);
@@ -323,13 +400,116 @@ function readTransferCredentials(): TransferCredentials | null {
   }
 }
 
+function readGithubCredentialsBackup(): GithubTransferCredentials | null {
+  try {
+    const envelope = JSON.parse(fs.readFileSync(getGithubCredentialsBackupPath(), "utf8")) as {
+      mode?: "encrypted" | "plain";
+      value?: string;
+    };
+    if (!envelope.value) {
+      return null;
+    }
+    const raw = envelope.mode === "encrypted" && safeStorage.isEncryptionAvailable()
+      ? safeStorage.decryptString(Buffer.from(envelope.value, "base64"))
+      : envelope.value;
+    const credentials = JSON.parse(raw) as TransferCredentials;
+    return isGithubCredentials(credentials) ? credentials : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeJsonAtomically(filePath: string, value: unknown): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  const descriptor = fs.openSync(temporaryPath, "wx", 0o600);
+  try {
+    fs.writeFileSync(descriptor, JSON.stringify(value, null, 2), "utf8");
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  try {
+    fs.renameSync(temporaryPath, filePath);
+  } catch (error) {
+    try {
+      fs.unlinkSync(temporaryPath);
+    } catch {
+      // Preserve the original rename error.
+    }
+    throw error;
+  }
+}
+
+async function writeBufferAtomically(filePath: string, bytes: Buffer): Promise<void> {
+  await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+  const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  const descriptor = await fs.promises.open(temporaryPath, "wx", 0o600);
+  try {
+    await descriptor.writeFile(bytes);
+    await descriptor.sync();
+  } finally {
+    await descriptor.close();
+  }
+  try {
+    await fs.promises.rename(temporaryPath, filePath);
+  } catch (error) {
+    await fs.promises.unlink(temporaryPath).catch(() => undefined);
+    throw error;
+  }
+}
+
 function writeTransferCredentials(credentials: TransferCredentials): void {
   fs.mkdirSync(path.dirname(getTransferCredentialsPath()), { recursive: true });
   const raw = JSON.stringify(credentials);
   const envelope = safeStorage.isEncryptionAvailable()
     ? { mode: "encrypted" as const, value: safeStorage.encryptString(raw).toString("base64") }
     : { mode: "plain" as const, value: raw };
-  fs.writeFileSync(getTransferCredentialsPath(), JSON.stringify(envelope, null, 2), "utf8");
+  writeJsonAtomically(getTransferCredentialsPath(), envelope);
+}
+
+function writeGithubCredentialsBackup(credentials: GithubTransferCredentials): void {
+  const backupPath = getGithubCredentialsBackupPath();
+  fs.mkdirSync(path.dirname(backupPath), { recursive: true });
+  const raw = JSON.stringify(credentials);
+  const envelope = safeStorage.isEncryptionAvailable()
+    ? { mode: "encrypted" as const, value: safeStorage.encryptString(raw).toString("base64") }
+    : { mode: "plain" as const, value: raw };
+  writeJsonAtomically(backupPath, envelope);
+}
+
+async function ensureGithubBackupCredentials(
+  credentials: CloudflareTransferCredentials,
+): Promise<GithubTransferCredentials | null> {
+  const saved = readGithubCredentialsBackup();
+  if (saved && saved.channelId === credentials.channelId && saved.roomKey === credentials.roomKey) {
+    githubBackupLastError = undefined;
+    return saved;
+  }
+  if (!GITHUB_TRANSFER_OWNER || !GITHUB_TRANSFER_REPO) {
+    githubBackupLastError = "未找到 GitHub 备用仓库配置";
+    return null;
+  }
+  try {
+    const token = await getGithubToken();
+    const backup: GithubTransferCredentials = {
+      mode: "github",
+      channelId: credentials.channelId,
+      roomKey: credentials.roomKey,
+      createdAt: credentials.createdAt,
+      githubOwner: GITHUB_TRANSFER_OWNER,
+      githubRepo: GITHUB_TRANSFER_REPO,
+      githubBranch: GITHUB_TRANSFER_BRANCH,
+      githubToken: token,
+    };
+    writeGithubCredentialsBackup(backup);
+    githubBackupLastError = undefined;
+    return backup;
+  } catch (error) {
+    githubBackupLastError = transferErrorMessage(error);
+    githubBackupReconciliationPending = true;
+    return null;
+  }
 }
 
 function readPendingUploads(): PendingUpload[] {
@@ -368,6 +548,635 @@ function writeUploadedFileManifest(manifest: UploadedFileManifest): void {
   fs.writeFileSync(getUploadedFileManifestPath(), JSON.stringify(manifest, null, 2), "utf8");
 }
 
+function readPendingGithubBackups(): PendingGithubBackup[] {
+  try {
+    const value = JSON.parse(fs.readFileSync(getGithubBackupQueuePath(), "utf8")) as unknown;
+    if (!Array.isArray(value)) {
+      return [];
+    }
+    return value.filter((item): item is PendingGithubBackup => Boolean(
+      item
+      && typeof item === "object"
+      && typeof (item as PendingGithubBackup).channelId === "string"
+      && typeof (item as PendingGithubBackup).image?.id === "string"
+      && typeof (item as PendingGithubBackup).hasPreview === "boolean",
+    ));
+  } catch {
+    return [];
+  }
+}
+
+function writePendingGithubBackups(queue: PendingGithubBackup[]): void {
+  writeJsonAtomically(getGithubBackupQueuePath(), queue);
+}
+
+async function withGithubBackupQueueWrite<T>(operation: () => Promise<T> | T): Promise<T> {
+  const previous = githubBackupQueueWritePromise;
+  let release!: () => void;
+  githubBackupQueueWritePromise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
+async function enqueueGithubBackup(
+  credentials: CloudflareTransferCredentials,
+  image: RemoteImage,
+  encrypted: Buffer,
+  encryptedPreview?: Buffer,
+  repair: { imageBlob?: boolean; previewBlob?: boolean } = {},
+): Promise<void> {
+  const hasPreview = Boolean(encryptedPreview && image.previewNonce);
+  await withGithubBackupQueueWrite(async () => {
+    const queue = readPendingGithubBackups();
+    const existingIndex = queue.findIndex((item) => item.channelId === credentials.channelId && item.image.id === image.id);
+    if (existingIndex >= 0) {
+      const existing = queue[existingIndex];
+      if (encrypted.length > 0) {
+        await writeBufferAtomically(getGithubBackupObjectPath(image.id), encrypted);
+      }
+      if (hasPreview && encryptedPreview) {
+        await writeBufferAtomically(getGithubBackupObjectPath(image.id, true), encryptedPreview);
+      }
+      queue[existingIndex] = {
+        ...existing,
+        image: { ...existing.image, ...image },
+        hasImageBlob: existing.hasImageBlob !== false || encrypted.length > 0,
+        hasPreview: existing.hasPreview || hasPreview,
+        repairImageBlob: existing.repairImageBlob || repair.imageBlob || undefined,
+        repairPreviewBlob: existing.repairPreviewBlob || repair.previewBlob || undefined,
+        revision: randomUUID(),
+        queuedAt: new Date().toISOString(),
+      };
+      writePendingGithubBackups(queue);
+      return;
+    }
+
+    if (encrypted.length > 0) {
+      await writeBufferAtomically(getGithubBackupObjectPath(image.id), encrypted);
+    }
+    if (hasPreview && encryptedPreview) {
+      await writeBufferAtomically(getGithubBackupObjectPath(image.id, true), encryptedPreview);
+    }
+    writePendingGithubBackups([
+      ...queue,
+      {
+        channelId: credentials.channelId,
+        image,
+        hasImageBlob: encrypted.length > 0,
+        hasPreview,
+        revision: randomUUID(),
+        ...(repair.imageBlob ? { repairImageBlob: true } : {}),
+        ...(repair.previewBlob ? { repairPreviewBlob: true } : {}),
+        queuedAt: new Date().toISOString(),
+      },
+    ]);
+  });
+  githubBackupLastError = undefined;
+}
+
+async function enqueueGithubBackupFromServer(
+  credentials: CloudflareTransferCredentials,
+  image: RemoteImage,
+  repair: { imageBlob?: boolean; previewBlob?: boolean } = {},
+): Promise<void> {
+  const github = await ensureGithubBackupCredentials(credentials);
+  if (!github) {
+    return;
+  }
+  const manifest = await getGithubBackupManifest(github);
+  const existing = manifest.images.find((item) => item.id === image.id);
+  if (existing) {
+    if ((existing.sha256 && existing.sha256 !== image.sha256)
+      || (existing.plainSize !== undefined && existing.plainSize !== image.plainSize)) {
+      throw new Error(`GitHub 备用照片 ${image.id} 与主服务器内容不一致`);
+    }
+    if (!repair.imageBlob && !repair.previewBlob && (!image.previewNonce || existing.previewNonce)) {
+      return;
+    }
+  }
+  const needsImageBlob = !existing || repair.imageBlob;
+  const needsPreviewBlob = Boolean(image.previewNonce && (!existing?.previewNonce || repair.previewBlob));
+  let encrypted = Buffer.alloc(0);
+  if (needsImageBlob) {
+    const encryptedResponse = await requestTransfer(
+      `/v1/channel/${encodeURIComponent(credentials.channelId)}/images/${encodeURIComponent(image.id)}/content`,
+      {},
+      credentials.ownerToken,
+      credentials.api,
+    );
+    encrypted = Buffer.from(await encryptedResponse.arrayBuffer());
+  }
+  let encryptedPreview: Buffer | undefined;
+  if (needsPreviewBlob && image.previewNonce) {
+    const previewResponse = await requestTransfer(
+      `/v1/channel/${encodeURIComponent(credentials.channelId)}/images/${encodeURIComponent(image.id)}/preview`,
+      {},
+      credentials.ownerToken,
+      credentials.api,
+    );
+    encryptedPreview = Buffer.from(await previewResponse.arrayBuffer());
+  }
+  const normalizedImage = existing
+    ? { ...existing, ...image, storagePath: existing.storagePath }
+    : image;
+  await enqueueGithubBackup(credentials, normalizedImage, encrypted, encryptedPreview, repair);
+}
+
+async function getGithubBackupManifest(
+  credentials: GithubTransferCredentials,
+  refresh = false,
+): Promise<GithubManifest> {
+  const now = Date.now();
+  if (
+    !refresh
+    && githubBackupManifestCache
+    && githubBackupManifestCache.channelId === credentials.channelId
+    && githubBackupManifestCache.expiresAt > now
+  ) {
+    return githubBackupManifestCache.manifest;
+  }
+  const manifest = await readGithubManifest(credentials);
+  githubBackupManifestCache = {
+    channelId: credentials.channelId,
+    expiresAt: now + 15_000,
+    manifest,
+  };
+  return manifest;
+}
+
+async function markGithubBackupFailure(item: PendingGithubBackup, error: unknown): Promise<void> {
+  const lastError = transferErrorMessage(error);
+  let marked = false;
+  await withGithubBackupQueueWrite(() => {
+    const queue = readPendingGithubBackups();
+    const updated = queue.map((candidate) => (
+      candidate.channelId === item.channelId
+      && candidate.image.id === item.image.id
+      && sameGithubBackupRevision(candidate, item)
+        ? {
+          ...candidate,
+          attemptCount: (candidate.attemptCount ?? 0) + 1,
+          lastAttemptAt: new Date().toISOString(),
+          lastError,
+          revision: randomUUID(),
+        }
+        : candidate
+    ));
+    marked = updated.some((candidate, index) => candidate !== queue[index]);
+    if (marked) {
+      writePendingGithubBackups(updated);
+    }
+  });
+  if (marked) {
+    githubBackupLastError = lastError;
+  }
+}
+
+function sameGithubBackupRevision(left: PendingGithubBackup, right: PendingGithubBackup): boolean {
+  return left.revision
+    ? left.revision === right.revision
+    : !right.revision && left.queuedAt === right.queuedAt;
+}
+
+async function removePendingGithubBackup(item: PendingGithubBackup): Promise<boolean> {
+  let removed = false;
+  await withGithubBackupQueueWrite(async () => {
+    const queue = readPendingGithubBackups();
+    const matching = queue.some((candidate) => (
+      candidate.channelId === item.channelId
+      && candidate.image.id === item.image.id
+      && sameGithubBackupRevision(candidate, item)
+    ));
+    if (!matching) {
+      return;
+    }
+    const next = queue.filter((candidate) => (
+      candidate.channelId !== item.channelId
+      || candidate.image.id !== item.image.id
+      || !sameGithubBackupRevision(candidate, item)
+    ));
+    writePendingGithubBackups(next);
+    removed = true;
+    for (const objectPath of [getGithubBackupObjectPath(item.image.id), getGithubBackupObjectPath(item.image.id, true)]) {
+      await fs.promises.unlink(objectPath).catch(() => undefined);
+    }
+  });
+  return removed;
+}
+
+async function uploadPendingGithubBackup(
+  credentials: GithubTransferCredentials,
+  item: PendingGithubBackup,
+): Promise<boolean> {
+  if (item.channelId !== credentials.channelId) {
+    throw new Error("GitHub 备用通道与当前照片通道不匹配");
+  }
+  const payload = await withGithubBackupQueueWrite(async () => {
+    const current = readPendingGithubBackups().find((candidate) => (
+      candidate.channelId === item.channelId && candidate.image.id === item.image.id
+    ));
+    if (!current) {
+      return null;
+    }
+    const encrypted = current.hasImageBlob === false
+      ? Buffer.alloc(0)
+      : await fs.promises.readFile(getGithubBackupObjectPath(current.image.id));
+    let preview: GithubPreviewUpload | undefined;
+    if (current.hasPreview && current.image.previewNonce) {
+      const encryptedPreview = await fs.promises.readFile(getGithubBackupObjectPath(current.image.id, true));
+      preview = {
+        encrypted: encryptedPreview,
+        nonce: current.image.previewNonce,
+        sizeBytes: current.image.previewSizeBytes ?? encryptedPreview.length,
+        mimeType: current.image.previewMimeType ?? "image/jpeg",
+        plainSize: current.image.previewPlainSize ?? Math.max(0, encryptedPreview.length - 16),
+        storagePath: githubPreviewPath(credentials, current.image.id),
+      };
+    }
+    return { item: current, encrypted, preview };
+  });
+  if (!payload) {
+    return false;
+  }
+  const { item: current, encrypted, preview } = payload;
+  await uploadGithubImage(credentials, current.image, encrypted, preview, {
+    restoreImageBlob: current.repairImageBlob,
+    restorePreviewBlob: current.repairPreviewBlob,
+  });
+  githubBackupManifestCache = null;
+  const removed = await removePendingGithubBackup(current);
+  if (removed) {
+    githubBackupLastError = undefined;
+  }
+  return removed;
+}
+
+async function reconcileGithubBackup(
+  credentials: CloudflareTransferCredentials,
+  github: GithubTransferCredentials,
+): Promise<void> {
+  const [serverImages, manifest, githubFiles] = await Promise.all([
+    listRemoteImages(credentials),
+    getGithubBackupManifest(github, true),
+    listGithubFilePaths(github),
+  ]);
+  const githubImages = new Map(manifest.images.map((image) => [image.id, image]));
+  const metadataRepairs: RemoteImage[] = [];
+  for (const image of serverImages) {
+    const existing = githubImages.get(image.id);
+    if (!existing) {
+      continue;
+    }
+    if ((existing.sha256 && existing.sha256 !== image.sha256)
+      || (existing.plainSize !== undefined && existing.plainSize !== image.plainSize)) {
+      throw new Error(`GitHub 备用照片 ${image.id} 与主服务器内容不一致`);
+    }
+    if (
+      !existing.sha256
+      || existing.plainSize === undefined
+      || !existing.storagePath
+      || existing.nonce !== image.nonce
+      || existing.createdAt !== image.createdAt
+      || existing.mimeType !== image.mimeType
+    ) {
+      const repaired = {
+        ...existing,
+        ...image,
+        storagePath: existing.storagePath || githubImagePath(github, image.id),
+      };
+      metadataRepairs.push(repaired);
+      githubImages.set(image.id, repaired);
+    }
+  }
+  if (metadataRepairs.length > 0) {
+    await updateGithubManifestImages(github, metadataRepairs, "Repair legacy photo metadata");
+    githubBackupManifestCache = null;
+  }
+  const queuedIds = new Set(
+    readPendingGithubBackups()
+      .filter((item) => item.channelId === credentials.channelId)
+      .map((item) => item.image.id),
+  );
+  for (const image of serverImages) {
+    const existing = githubImages.get(image.id);
+    const mainPath = existing?.storagePath || githubImagePath(github, image.id);
+    const previewPath = existing?.previewStoragePath || githubPreviewPath(github, image.id);
+    const repairImageBlob = Boolean(existing && (!githubFiles.has(mainPath) || existing.nonce !== image.nonce));
+    const repairPreviewBlob = Boolean(image.previewNonce && existing?.previewNonce
+      && (!githubFiles.has(previewPath) || existing.previewNonce !== image.previewNonce));
+    const needsBackup = !existing || repairImageBlob || Boolean(image.previewNonce && !existing?.previewNonce) || repairPreviewBlob;
+    if (!needsBackup || (queuedIds.has(image.id) && !repairImageBlob && !repairPreviewBlob)) {
+      continue;
+    }
+
+    await enqueueGithubBackupFromServer(credentials, image, {
+      imageBlob: !existing || repairImageBlob,
+      previewBlob: Boolean(image.previewNonce && (!existing?.previewNonce || repairPreviewBlob)),
+    });
+    queuedIds.add(image.id);
+    const queued = readPendingGithubBackups().find((item) => item.channelId === credentials.channelId && item.image.id === image.id);
+    if (queued) {
+      try {
+        await uploadPendingGithubBackup(github, queued);
+        githubFiles.add(githubImagePath(github, image.id));
+        if (image.previewNonce) {
+          githubFiles.add(githubPreviewPath(github, image.id));
+        }
+      } catch (error) {
+        const current = readPendingGithubBackups().find((item) => item.channelId === queued.channelId && item.image.id === queued.image.id);
+        await markGithubBackupFailure(current ?? queued, error);
+        throw error;
+      }
+    }
+  }
+  githubBackupReconciliationPending = false;
+  githubBackupReconciliationAttempts = 0;
+  githubBackupLastError = undefined;
+}
+
+async function getGithubMigrationCredentials(
+  legacy: CloudflareTransferCredentials,
+): Promise<GithubTransferCredentials> {
+  const sourceGithub = legacy.migrationSourceGithub;
+  if (sourceGithub && sourceGithub.channelId === legacy.channelId && sourceGithub.roomKey === legacy.roomKey) {
+    return sourceGithub;
+  }
+
+  const saved = readGithubCredentialsBackup();
+  if (saved && saved.channelId === legacy.channelId && saved.roomKey === legacy.roomKey) {
+    return saved;
+  }
+
+  if (!GITHUB_TRANSFER_OWNER || !GITHUB_TRANSFER_REPO) {
+    throw new Error("GitHub 私有仓库尚未配置。请配置 GITHUB_TRANSFER_OWNER 和 GITHUB_TRANSFER_REPO；旧 ECS 照片仍保留，本机照片同步已暂停。");
+  }
+
+  const token = await getGithubToken();
+  return {
+    mode: "github",
+    channelId: legacy.channelId,
+    roomKey: legacy.roomKey,
+    githubOwner: GITHUB_TRANSFER_OWNER,
+    githubRepo: GITHUB_TRANSFER_REPO,
+    githubBranch: GITHUB_TRANSFER_BRANCH,
+    githubToken: token,
+    createdAt: legacy.createdAt,
+  };
+}
+
+async function verifyLegacyPhotosInGithub(
+  legacyImages: RemoteImage[],
+  github: GithubTransferCredentials,
+): Promise<void> {
+  const [manifest, githubFiles] = await Promise.all([
+    readGithubManifest(github),
+    listGithubFilePaths(github),
+  ]);
+  const images = new Map(manifest.images.map((image) => [image.id, image]));
+
+  for (const legacyImage of legacyImages) {
+    const image = images.get(legacyImage.id);
+    if (!image || image.nonce !== legacyImage.nonce) {
+      throw new Error(`旧 ECS 照片 ${legacyImage.id} 尚未完整迁移到 GitHub`);
+    }
+    if (
+      (legacyImage.sha256 && image.sha256 !== legacyImage.sha256)
+      || (legacyImage.plainSize !== undefined && image.plainSize !== legacyImage.plainSize)
+    ) {
+      throw new Error(`旧 ECS 照片 ${legacyImage.id} 的 GitHub 校验信息不一致`);
+    }
+
+    const imagePath = image.storagePath || githubImagePath(github, image.id);
+    if (!githubFiles.has(imagePath)) {
+      throw new Error(`旧 ECS 照片 ${legacyImage.id} 的 GitHub 原图文件缺失`);
+    }
+
+    if (legacyImage.previewNonce) {
+      if (image.previewNonce !== legacyImage.previewNonce) {
+        throw new Error(`旧 ECS 照片 ${legacyImage.id} 的 GitHub 预览图尚未完整迁移`);
+      }
+      const previewPath = image.previewStoragePath || githubPreviewPath(github, image.id);
+      if (!githubFiles.has(previewPath)) {
+        throw new Error(`旧 ECS 照片 ${legacyImage.id} 的 GitHub 预览文件缺失`);
+      }
+    }
+  }
+}
+
+async function migrateLegacyTransferToGithubInternal(
+  legacy: CloudflareTransferCredentials,
+): Promise<GithubTransferCredentials> {
+  const github = await getGithubMigrationCredentials(legacy);
+  const oldApi = transferApiBaseUrl(legacy);
+  if (!oldApi) {
+    throw new Error("旧 ECS 收图服务地址不可用，无法核对旧照片；本机照片同步已暂停，旧云端照片未删除。");
+  }
+
+  // Read the legacy index once, then copy any missing encrypted objects to
+  // GitHub. The old ECS is only read during this transition and is never used
+  // for new uploads or pairing after the GitHub credentials are saved.
+  remoteImagesCache = null;
+  const legacyImages = await listRemoteImages(legacy, oldApi);
+  // The existing backup queue resolves its target through the saved GitHub
+  // credentials. Pin that target before draining it; the main credential is
+  // still unchanged until the integrity check succeeds below.
+  writeGithubCredentialsBackup(github);
+  for (const item of readPendingGithubBackups().filter((entry) => entry.channelId === legacy.channelId)) {
+    await uploadPendingGithubBackup(github, item);
+  }
+  await reconcileGithubBackup(legacy, github);
+  await verifyLegacyPhotosInGithub(legacyImages, github);
+
+  if (readPendingGithubBackups().some((item) => item.channelId === legacy.channelId)) {
+    throw new Error("仍有旧照片等待写入 GitHub；迁移未完成，本机照片同步已暂停。");
+  }
+
+  // Switch the primary credential only after every old ECS image and its
+  // preview has a matching GitHub manifest entry and object. Keep the legacy
+  // ECS data untouched so a failed or interrupted transition cannot lose it.
+  writeGithubCredentialsBackup(github);
+  writeTransferCredentials(github);
+  remoteImagesCache = null;
+  githubBackupManifestCache = null;
+  githubBackupReconciliationPending = false;
+  githubBackupReconciliationAttempts = 0;
+  githubBackupLastError = undefined;
+  return github;
+}
+
+async function migrateLegacyTransferToGithub(
+  legacy: CloudflareTransferCredentials,
+): Promise<GithubTransferCredentials> {
+  if (legacyGithubMigrationPromise) {
+    return legacyGithubMigrationPromise;
+  }
+  const task = migrateLegacyTransferToGithubInternal(legacy);
+  legacyGithubMigrationPromise = task;
+  try {
+    return await task;
+  } finally {
+    if (legacyGithubMigrationPromise === task) {
+      legacyGithubMigrationPromise = null;
+    }
+  }
+}
+
+function pendingGithubBackupRetryDelayMs(): number {
+  const queue = readPendingGithubBackups();
+  const attempts = queue.length > 0
+    ? Math.min(...queue.map((item) => Math.max(1, item.attemptCount ?? 1)))
+    : Math.max(1, githubBackupReconciliationAttempts);
+  return Math.min(PENDING_UPLOAD_RETRY_MAX_MS, PENDING_UPLOAD_RETRY_BASE_MS * (2 ** Math.min(5, attempts - 1)));
+}
+
+function clearGithubBackupRetryTimer(): void {
+  if (pendingGithubBackupRetryTimer) {
+    clearTimeout(pendingGithubBackupRetryTimer);
+    pendingGithubBackupRetryTimer = null;
+  }
+  pendingGithubBackupRetryDueAt = 0;
+}
+
+function hasGithubBackupRetrySource(): boolean {
+  const transfer = readTransferCredentials();
+  if (!transfer || isGithubCredentials(transfer)) {
+    return false;
+  }
+  const saved = readGithubCredentialsBackup();
+  return Boolean(
+    (saved && saved.channelId === transfer.channelId && saved.roomKey === transfer.roomKey)
+    || (GITHUB_TRANSFER_OWNER && GITHUB_TRANSFER_REPO),
+  );
+}
+
+function scheduleGithubBackupRetry(delayMs = pendingGithubBackupRetryDelayMs(), reconcile = false): void {
+  if (isQuitting) {
+    return;
+  }
+  if (reconcile) {
+    githubBackupReconciliationPending = true;
+  }
+  if (readPendingGithubBackups().length === 0 && !githubBackupReconciliationPending) {
+    clearGithubBackupRetryTimer();
+    return;
+  }
+  if (!hasGithubBackupRetrySource()) {
+    githubBackupReconciliationPending = false;
+    clearGithubBackupRetryTimer();
+    return;
+  }
+  const nextDueAt = Date.now() + Math.max(0, delayMs);
+  if (pendingGithubBackupRetryTimer && pendingGithubBackupRetryDueAt <= nextDueAt) {
+    return;
+  }
+  clearGithubBackupRetryTimer();
+  pendingGithubBackupRetryDueAt = nextDueAt;
+  pendingGithubBackupRetryTimer = setTimeout(() => {
+    pendingGithubBackupRetryTimer = null;
+    pendingGithubBackupRetryDueAt = 0;
+    void retryPendingGithubBackups().catch((error) => {
+      githubBackupLastError = transferErrorMessage(error);
+      githubBackupReconciliationPending = true;
+      githubBackupReconciliationAttempts += 1;
+      scheduleGithubBackupRetry();
+    });
+  }, Math.max(0, delayMs));
+}
+
+async function retryPendingGithubBackups(forceReconcile = false): Promise<GithubBackupRetryResult> {
+  if (forceReconcile) {
+    githubBackupReconciliationPending = true;
+  }
+  if (pendingGithubBackupRetryPromise) {
+    return pendingGithubBackupRetryPromise;
+  }
+  clearGithubBackupRetryTimer();
+
+  const task = (async (): Promise<GithubBackupRetryResult> => {
+    const transfer = readTransferCredentials();
+    if (!transfer || isGithubCredentials(transfer)) {
+      githubBackupReconciliationPending = false;
+      return { sent: 0, failed: 0, remaining: readPendingGithubBackups().length };
+    }
+    const github = await ensureGithubBackupCredentials(transfer);
+    if (!github) {
+      const canRetryConfiguration = Boolean(GITHUB_TRANSFER_OWNER && GITHUB_TRANSFER_REPO);
+      githubBackupReconciliationPending = canRetryConfiguration;
+      if (canRetryConfiguration) {
+        githubBackupReconciliationAttempts += 1;
+      }
+      const lastError = githubBackupLastError ?? "GitHub 备用通道尚未配置";
+      return {
+        sent: 0,
+        failed: readPendingGithubBackups().length,
+        remaining: readPendingGithubBackups().length,
+        lastError,
+      };
+    }
+
+    let sent = 0;
+    let failed = 0;
+    let lastError: string | undefined;
+    const uploadQueue = async () => {
+      for (const item of readPendingGithubBackups().filter((entry) => entry.channelId === transfer.channelId)) {
+        try {
+          if (await uploadPendingGithubBackup(github, item)) {
+            sent += 1;
+          }
+        } catch (error) {
+          const current = readPendingGithubBackups().find((candidate) => (
+            candidate.channelId === item.channelId && candidate.image.id === item.image.id
+          ));
+          await markGithubBackupFailure(current ?? item, error);
+          failed += 1;
+          lastError = transferErrorMessage(error);
+        }
+      }
+    };
+
+    await uploadQueue();
+    if (failed === 0 && githubBackupReconciliationPending) {
+      try {
+        await reconcileGithubBackup(transfer, github);
+        await uploadQueue();
+        if (failed > 0) {
+          githubBackupReconciliationPending = true;
+        }
+      } catch (error) {
+        githubBackupLastError = transferErrorMessage(error);
+        githubBackupReconciliationPending = true;
+        githubBackupReconciliationAttempts += 1;
+        failed += 1;
+        lastError = githubBackupLastError;
+      }
+    }
+
+    return {
+      sent,
+      failed,
+      remaining: readPendingGithubBackups().filter((item) => item.channelId === transfer.channelId).length,
+      ...(lastError ? { lastError } : {}),
+    };
+  })();
+  pendingGithubBackupRetryPromise = task;
+  try {
+    return await task;
+  } finally {
+    if (pendingGithubBackupRetryPromise === task) {
+      pendingGithubBackupRetryPromise = null;
+    }
+    if (readPendingGithubBackups().length > 0 || githubBackupReconciliationPending) {
+      scheduleGithubBackupRetry();
+    }
+  }
+}
+
 function rememberUploadedFile(filePath: string, stat: fs.Stats, sha256: string, image: RemoteImage): void {
   const manifest = readUploadedFileManifest();
   const normalizedPath = normalizeFilePath(filePath);
@@ -395,7 +1204,7 @@ function rememberUploadedFile(filePath: string, stat: fs.Stats, sha256: string, 
 
 function upsertPendingUpload(
   filePath: string,
-  details: { size: number; mtimeMs: number; sha256: string; mimeType: string; createdAt?: string },
+  details: { size: number; mtimeMs: number; sha256: string; mimeType: string; createdAt?: string; imageId?: string; nonce?: string },
 ): PendingUpload {
   const queue = readPendingUploads();
   const normalizedPath = normalizeFilePath(filePath);
@@ -411,8 +1220,8 @@ function upsertPendingUpload(
 
   const next: PendingUpload = {
     path: filePath,
-    imageId: randomUUID(),
     ...details,
+    imageId: details.imageId ?? randomUUID(),
     createdAt: details.createdAt ?? new Date().toISOString(),
   };
   writePendingUploads([
@@ -444,6 +1253,27 @@ function rememberPendingNonce(filePath: string, nonce: string): void {
 
 function transferErrorMessage(error: unknown): string {
   return error instanceof Error && error.message ? error.message : "未知传输错误";
+}
+
+function isRetryableLocalUploadError(error: unknown): boolean {
+  const message = transferErrorMessage(error);
+  if (message === "照片仍在写入，稍后会自动重试" || message === "照片在校验时发生变化，稍后会自动重试") {
+    return true;
+  }
+  if (!error || typeof error !== "object" || !("code" in error)) {
+    return false;
+  }
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "EBUSY" || code === "EAGAIN" || code === "EINTR" || code === "EPERM" || code === "EACCES";
+}
+
+function enqueuePendingUploadPlaceholder(filePath: string): void {
+  const normalizedPath = normalizeFilePath(filePath);
+  const queue = readPendingUploads();
+  if (queue.some((item) => normalizeFilePath(item.path) === normalizedPath)) {
+    return;
+  }
+  writePendingUploads([...queue, { path: filePath, createdAt: new Date().toISOString() }]);
 }
 
 function markPendingUploadFailure(filePath: string, error: unknown): boolean {
@@ -530,8 +1360,9 @@ async function requestTransfer(
   pathname: string,
   init: RequestInit = {},
   ownerToken?: string,
-  baseUrl = TRANSFER_API_BASE_URL,
+  configuredBaseUrl?: string,
 ): Promise<Response> {
+  const baseUrl = (configuredBaseUrl || readTransferServerBootstrapConfig()?.api || TRANSFER_API_BASE_URL).replace(/\/+$/, "");
   if (!baseUrl) {
     throw new Error("尚未配置手机收图服务地址");
   }
@@ -602,8 +1433,9 @@ async function requestTransfer(
 
 async function listRemoteImages(
   credentials: CloudflareTransferCredentials,
-  baseUrl = TRANSFER_API_BASE_URL,
+  configuredBaseUrl?: string,
 ): Promise<RemoteImage[]> {
+  const baseUrl = transferApiBaseUrl(credentials) || configuredBaseUrl || "";
   const now = Date.now();
   if (remoteImagesCache && remoteImagesCache.channelId === credentials.channelId && remoteImagesCache.expiresAt > now) {
     return remoteImagesCache.images;
@@ -625,31 +1457,11 @@ async function listRemoteImages(
   return images;
 }
 
-function rememberRemoteImage(credentials: CloudflareTransferCredentials, image: RemoteImage): void {
-  if (!remoteImagesCache || remoteImagesCache.channelId !== credentials.channelId) {
-    return;
-  }
-  remoteImagesCache = {
-    ...remoteImagesCache,
-    images: [image, ...remoteImagesCache.images.filter((item) => item.id !== image.id)],
-  };
-}
-
-function createPairingPayload(credentials: CloudflareTransferCredentials, pairingToken: string | undefined): string | null {
-  if (!pairingToken) {
+function createGithubPairingPayload(credentials: GithubTransferCredentials): string | null {
+  const receiverToken = GITHUB_TRANSFER_READ_TOKEN;
+  if (!receiverToken) {
     return null;
   }
-  return JSON.stringify({
-    version: 1,
-    app: "取景台",
-    api: TRANSFER_API_BASE_URL,
-    channelId: credentials.channelId,
-    pairingToken,
-    roomKey: credentials.roomKey,
-  });
-}
-
-function createGithubPairingPayload(credentials: GithubTransferCredentials): string {
   return JSON.stringify({
     version: 2,
     app: "取景台",
@@ -661,7 +1473,7 @@ function createGithubPairingPayload(credentials: GithubTransferCredentials): str
       owner: credentials.githubOwner,
       repo: credentials.githubRepo,
       branch: credentials.githubBranch,
-      token: credentials.githubToken,
+      token: receiverToken,
     },
   });
 }
@@ -683,13 +1495,47 @@ function unconfiguredTransferState(lastError?: string): TransferChannelState {
   };
 }
 
+function legacyMigrationBlockedState(
+  credentials: CloudflareTransferCredentials,
+  error: unknown,
+): TransferChannelState {
+  const reason = transferErrorMessage(error);
+  return {
+    status: "offline",
+    backend: "github",
+    channelId: credentials.channelId,
+    pairingPayload: null,
+    pairingPayloads: [],
+    pairingExpiresAt: null,
+    paired: false,
+    receiverCount: 0,
+    maxReceivers: 2,
+    receiverOnline: false,
+    imageCount: 0,
+    ...pendingUploadFeedback(),
+    lastError: `旧 ECS 照片迁移到 GitHub 尚未完成，已暂停照片上传；旧云端照片未删除。${reason}`,
+  };
+}
+
 async function getTransferState(): Promise<TransferChannelState> {
-  const credentials = readTransferCredentials();
+  let credentials = readTransferCredentials();
   if (!credentials) {
     return unconfiguredTransferState("点击“创建通道”初始化 GitHub 私有中转。");
   }
 
+  if (!isGithubCredentials(credentials)) {
+    const legacyCredentials = credentials;
+    try {
+      credentials = await migrateLegacyTransferToGithub(credentials);
+    } catch (error) {
+      return legacyMigrationBlockedState(legacyCredentials, error);
+    }
+  }
+
   if (isGithubCredentials(credentials)) {
+    const pairingPayload = createGithubPairingPayload(credentials);
+    const missingReceiverToken = !pairingPayload;
+    const receiverTokenError = "请配置 GITHUB_TRANSFER_READ_TOKEN（仅对该私有仓库授予 Contents 只读权限），重启桌面端后生成手机连接密钥。";
     try {
       const images = await listGithubImagesCached(credentials);
       remoteImagesCache = {
@@ -701,14 +1547,15 @@ async function getTransferState(): Promise<TransferChannelState> {
         status: "paired",
         backend: "github",
         channelId: credentials.channelId,
-        pairingPayload: createGithubPairingPayload(credentials),
-        pairingPayloads: [createGithubPairingPayload(credentials)],
+        pairingPayload,
+        pairingPayloads: pairingPayload ? [pairingPayload] : [],
         pairingExpiresAt: null,
         paired: true,
         receiverCount: 0,
         maxReceivers: 2,
         receiverOnline: false,
         imageCount: images.length,
+        ...(missingReceiverToken ? { lastError: receiverTokenError } : {}),
         ...pendingUploadFeedback(),
       };
     } catch (error) {
@@ -716,8 +1563,8 @@ async function getTransferState(): Promise<TransferChannelState> {
         status: "offline",
         backend: "github",
         channelId: credentials.channelId,
-        pairingPayload: createGithubPairingPayload(credentials),
-        pairingPayloads: [createGithubPairingPayload(credentials)],
+        pairingPayload,
+        pairingPayloads: pairingPayload ? [pairingPayload] : [],
         pairingExpiresAt: null,
         paired: true,
         receiverCount: 0,
@@ -725,104 +1572,71 @@ async function getTransferState(): Promise<TransferChannelState> {
         receiverOnline: false,
         imageCount: remoteImagesCache?.images.length ?? 0,
         ...pendingUploadFeedback(),
-        lastError: error instanceof Error ? error.message : "无法连接 GitHub 私有中转",
+        lastError: missingReceiverToken
+          ? receiverTokenError
+          : error instanceof Error ? error.message : "无法连接 GitHub 私有中转",
       };
     }
   }
-
-  if (!TRANSFER_API_BASE_URL) {
-    return unconfiguredTransferState("当前是旧的 Cloudflare 通道，请点击创建 GitHub 中转。");
-  }
-
-  try {
-    const response = await requestTransfer(`/v1/channel/${encodeURIComponent(credentials.channelId)}/state`, {}, credentials.ownerToken);
-    const state = await response.json() as ChannelStateResponse;
-    const pairingTokens = Array.isArray(state.pairingTokens)
-      ? state.pairingTokens
-      : state.pairingToken
-        ? [state.pairingToken]
-        : [];
-    const pairingPayloads: string[] = [];
-    for (const pairingToken of pairingTokens) {
-      const payload = createPairingPayload(credentials, pairingToken);
-      if (payload) {
-        pairingPayloads.push(payload);
-      }
-    }
-    return {
-      status: pairingPayloads.length > 0 ? "ready" : state.paired ? "paired" : "ready",
-      backend: "cloudflare",
-      channelId: credentials.channelId,
-      pairingPayload: pairingPayloads[0] ?? null,
-      pairingPayloads,
-      pairingExpiresAt: state.pairingExpiresAt ?? null,
-      paired: state.paired,
-      receiverCount: state.receiverCount ?? (state.paired ? 1 : 0),
-      maxReceivers: state.maxReceivers ?? 2,
-      receiverOnline: state.receiverOnline,
-      imageCount: state.imageCount,
-      ...pendingUploadFeedback(),
-    };
-  } catch (error) {
-    return {
-      status: "offline",
-      backend: "cloudflare",
-      channelId: credentials.channelId,
-      pairingPayload: null,
-      pairingPayloads: [],
-      pairingExpiresAt: null,
-      paired: false,
-      receiverCount: 0,
-      maxReceivers: 2,
-      receiverOnline: false,
-      imageCount: 0,
-      ...pendingUploadFeedback(),
-      lastError: error instanceof Error ? error.message : "无法连接手机收图服务",
-    };
-  }
+  return unconfiguredTransferState("GitHub 私有照片通道尚未就绪。");
 }
 
 async function ensureTransferChannel(): Promise<TransferChannelState> {
+  if (transferChannelSetupPromise) {
+    return transferChannelSetupPromise;
+  }
+  const task = ensureTransferChannelInternal();
+  transferChannelSetupPromise = task;
+  try {
+    return await task;
+  } finally {
+    if (transferChannelSetupPromise === task) {
+      transferChannelSetupPromise = null;
+    }
+  }
+}
+
+async function ensureTransferChannelInternal(): Promise<TransferChannelState> {
   let credentials = readTransferCredentials();
-  if (!isGithubCredentials(credentials)) {
+  if (credentials && !isGithubCredentials(credentials)) {
+    credentials = await migrateLegacyTransferToGithub(credentials);
+  }
+
+  if (!credentials) {
     if (!GITHUB_TRANSFER_OWNER || !GITHUB_TRANSFER_REPO) {
-      throw new Error("请先配置 GITHUB_TRANSFER_OWNER 和 GITHUB_TRANSFER_REPO，再创建私有收图通道。");
+      throw new Error("请配置 GITHUB_TRANSFER_OWNER 和 GITHUB_TRANSFER_REPO，再创建 GitHub 私有收图通道。");
     }
     const token = await getGithubToken();
-    const legacyCredentials = credentials && !isGithubCredentials(credentials) ? credentials : null;
     const nextCredentials: GithubTransferCredentials = {
       mode: "github",
-      channelId: legacyCredentials?.channelId ?? randomUUID(),
-      roomKey: legacyCredentials?.roomKey ?? encodeBase64Url(randomBytes(32)),
+      channelId: randomUUID(),
+      roomKey: encodeBase64Url(randomBytes(32)),
       githubOwner: GITHUB_TRANSFER_OWNER,
       githubRepo: GITHUB_TRANSFER_REPO,
       githubBranch: GITHUB_TRANSFER_BRANCH,
       githubToken: token,
       createdAt: new Date().toISOString(),
     };
-    if (legacyCredentials) {
-      await migrateLegacyCloudflareImages(legacyCredentials, nextCredentials);
-    }
     credentials = nextCredentials;
     writeTransferCredentials(nextCredentials);
     remoteImagesCache = null;
   }
 
-  if (isGithubCredentials(credentials)) {
-    try {
-      await repairGithubCaptureTimes(credentials);
-      await repairGithubMissingImages(credentials);
-    } catch (error) {
-      // A metadata repair must not prevent the desktop from opening or
-      // uploading new photos when GitHub is temporarily unavailable.
-      console.warn("Unable to repair photo capture times", error);
-    }
+  if (!isGithubCredentials(credentials)) {
+    throw new Error("桌面照片通道只支持 GitHub 私有仓库。");
+  }
+
+  try {
+    await repairGithubCaptureTimes(credentials);
+    await repairGithubMissingImages(credentials);
+  } catch (error) {
+    // A metadata repair must not prevent the desktop from opening or
+    // uploading new photos when GitHub is temporarily unavailable.
+    console.warn("Unable to repair photo capture times", error);
   }
 
   const state = await getTransferState();
-  if (isGithubCredentials(credentials)) {
-    scheduleGithubPreviewRepair(credentials);
-  }
+  scheduleGithubPreviewRepair(credentials);
   scheduleSnapshotFolderSync(0);
   return state;
 }
@@ -1024,24 +1838,20 @@ async function resetTransferPairing(): Promise<TransferChannelState> {
   if (!credentials) {
     return ensureTransferChannel();
   }
-  if (isGithubCredentials(credentials)) {
-    const nextCredentials: GithubTransferCredentials = {
-      ...credentials,
-      channelId: randomUUID(),
-      roomKey: encodeBase64Url(randomBytes(32)),
-      createdAt: new Date().toISOString(),
-    };
-    writeTransferCredentials(nextCredentials);
-    remoteImagesCache = null;
-    const state = await getTransferState();
-    scheduleSnapshotFolderSync(0);
-    return state;
-  }
-  if (!TRANSFER_API_BASE_URL) {
-    return unconfiguredTransferState("当前是旧的 Cloudflare 通道，请点击创建 GitHub 中转。");
-  }
-  await requestTransfer(`/v1/channel/${encodeURIComponent(credentials.channelId)}/reset`, { method: "POST" }, credentials.ownerToken);
+  const github = isGithubCredentials(credentials)
+    ? credentials
+    : await migrateLegacyTransferToGithub(credentials);
+  const nextCredentials: GithubTransferCredentials = {
+    ...github,
+    channelId: randomUUID(),
+    roomKey: encodeBase64Url(randomBytes(32)),
+    createdAt: new Date().toISOString(),
+  };
+  writeTransferCredentials(nextCredentials);
+  writeGithubCredentialsBackup(nextCredentials);
+  remoteImagesCache = null;
   const state = await getTransferState();
+  scheduleGithubPreviewRepair(nextCredentials);
   scheduleSnapshotFolderSync(0);
   return state;
 }
@@ -1111,185 +1921,100 @@ async function uploadGithubSnapshotFile(
   return savedImage;
 }
 
-async function migrateLegacyCloudflareImages(
-  legacy: CloudflareTransferCredentials,
-  github: GithubTransferCredentials,
-): Promise<void> {
-  if (!LEGACY_TRANSFER_API_BASE_URL) {
-    return;
-  }
-  const legacyImages = await listRemoteImages(legacy, LEGACY_TRANSFER_API_BASE_URL);
-  if (legacyImages.length === 0) {
-    return;
-  }
-
-  const batchSize = 8;
-  for (let index = 0; index < legacyImages.length; index += batchSize) {
-    const batch = legacyImages.slice(index, index + batchSize);
-    const encryptedBatch = await Promise.all(batch.map(async (image) => {
-      if (!image.nonce) {
-        throw new Error(`旧照片 ${image.id} 缺少解密随机数，无法迁移`);
-      }
-      const response = await requestTransfer(
-        `/v1/channel/${encodeURIComponent(legacy.channelId)}/images/${encodeURIComponent(image.id)}/content`,
-        {},
-        legacy.ownerToken,
-        LEGACY_TRANSFER_API_BASE_URL,
-      );
-      return {
-        image: { ...image, storagePath: githubImagePath(github, image.id) },
-        encrypted: Buffer.from(await response.arrayBuffer()),
-      };
-    }));
-    await uploadGithubImagesBatch(github, encryptedBatch);
-  }
-}
-
 async function uploadSnapshotFileInternal(filePath: string): Promise<RemoteImage> {
   const mimeType = getImageMimeType(filePath);
   if (!mimeType) {
     throw new Error("只支持 PNG、JPG、JPEG、WEBP、GIF、HEIC 和 HEIF 图片");
   }
 
-  try {
-    const beforeRead = await fs.promises.stat(filePath);
-    if (!beforeRead.isFile()) {
-      throw new Error("照片路径不是文件");
-    }
-    const manifest = readUploadedFileManifest();
-    const previous = manifest[normalizeFilePath(filePath)];
-    const credentials = readTransferCredentials();
+  const beforeRead = await fs.promises.stat(filePath);
+  if (!beforeRead.isFile()) {
+    throw new Error("照片路径不是文件");
+  }
+  const manifest = readUploadedFileManifest();
+  const previous = manifest[normalizeFilePath(filePath)];
+  let credentials = readTransferCredentials();
+  if (credentials && !isGithubCredentials(credentials)) {
+    credentials = await migrateLegacyTransferToGithub(credentials);
+  }
+  if (!isGithubCredentials(credentials)) {
+    throw new Error("GitHub 私有照片通道尚未就绪，照片已保存在本机。");
+  }
 
-    // Existing files are the common startup path. Two cheap stat calls are
-    // enough to avoid reading and hashing every original photo again. Only a
-    // new/changed file, or a missing remote copy, needs the full read.
-    const afterStat = await fs.promises.stat(filePath);
-    const unchangedLocalFile = Boolean(
-      previous
-      && previous.size === afterStat.size
-      && Math.abs(previous.mtimeMs - afterStat.mtimeMs) <= 2
-      && beforeRead.size === afterStat.size
-      && Math.abs(beforeRead.mtimeMs - afterStat.mtimeMs) <= 2
-    );
-    if (previous && unchangedLocalFile) {
-      if (!isGithubCredentials(credentials)) {
-        removePendingUpload(filePath);
-        return previous.image;
-      }
-
-      // A local upload record is only a hint. The GitHub manifest may have
-      // been rewritten or partially restored, so verify the image ID before
-      // treating the file as fully uploaded.
-      const remoteImages = await listGithubImagesCached(credentials);
-      const existingRemoteImage = remoteImages.find((image) => image.id === previous.image.id);
-      if (existingRemoteImage) {
-        rememberUploadedFile(filePath, afterStat, previous.sha256, existingRemoteImage);
-        removePendingUpload(filePath);
-        return existingRemoteImage;
-      }
-
-      const plain = await fs.promises.readFile(filePath);
-      if (plain.length > MAX_TRANSFER_BYTES) {
-        throw new Error("照片超过手机收图的大小限制");
-      }
-      const plainSha256 = createHash("sha256").update(plain).digest("hex");
-      if (plain.length !== previous.size || plainSha256 !== previous.sha256) {
-        throw new Error("照片在校验时发生变化，稍后会自动重试");
-      }
-
-      const recoveredPending: PendingUpload = {
-        path: filePath,
-        createdAt: getCaptureTimestamp(filePath, afterStat),
-        imageId: previous.image.id,
-        size: plain.length,
+  // Existing files are the common startup path. Two cheap stat calls are
+  // enough to avoid reading and hashing every original photo again. Only a
+  // new/changed file, or a missing remote copy, needs the full read.
+  const afterStat = await fs.promises.stat(filePath);
+  const unchangedLocalFile = Boolean(
+    previous
+    && previous.size === afterStat.size
+    && Math.abs(previous.mtimeMs - afterStat.mtimeMs) <= 2
+    && beforeRead.size === afterStat.size
+    && Math.abs(beforeRead.mtimeMs - afterStat.mtimeMs) <= 2
+  );
+  if (previous && unchangedLocalFile) {
+    let remoteImages: RemoteImage[];
+    try {
+      remoteImages = await listGithubImagesCached(credentials);
+    } catch (error) {
+      upsertPendingUpload(filePath, {
+        size: afterStat.size,
         mtimeMs: afterStat.mtimeMs,
-        sha256: plainSha256,
-        mimeType,
+        sha256: previous.sha256,
+        mimeType: previous.image.mimeType || mimeType,
+        createdAt: previous.image.createdAt ?? getCaptureTimestamp(filePath, afterStat),
+        imageId: previous.image.id,
         nonce: previous.image.nonce,
-      };
-      return uploadGithubSnapshotFile(credentials, filePath, plain, afterStat, mimeType, plainSha256, recoveredPending);
+      });
+      throw error;
+    }
+    const existingRemoteImage = remoteImages.find((image) => image.id === previous.image.id);
+    if (existingRemoteImage) {
+      rememberUploadedFile(filePath, afterStat, previous.sha256, existingRemoteImage);
+      removePendingUpload(filePath);
+      return existingRemoteImage;
     }
 
     const plain = await fs.promises.readFile(filePath);
-    const afterRead = await fs.promises.stat(filePath);
-    if (beforeRead.size !== afterRead.size || Math.abs(beforeRead.mtimeMs - afterRead.mtimeMs) > 2) {
-      throw new Error("照片仍在写入，稍后会自动重试");
-    }
     if (plain.length > MAX_TRANSFER_BYTES) {
       throw new Error("照片超过手机收图的大小限制");
     }
     const plainSha256 = createHash("sha256").update(plain).digest("hex");
+    if (plain.length !== previous.size || plainSha256 !== previous.sha256) {
+      throw new Error("照片在校验时发生变化，稍后会自动重试");
+    }
 
-    const pending = upsertPendingUpload(filePath, {
+    const recoveredPending: PendingUpload = {
+      path: filePath,
+      createdAt: getCaptureTimestamp(filePath, afterStat),
+      imageId: previous.image.id,
       size: plain.length,
-      mtimeMs: afterRead.mtimeMs,
+      mtimeMs: afterStat.mtimeMs,
       sha256: plainSha256,
       mimeType,
-      createdAt: getCaptureTimestamp(filePath, afterRead),
-    });
-    if (!credentials || (!isGithubCredentials(credentials) && !TRANSFER_API_BASE_URL)) {
-      throw new Error("手机收图通道尚未准备好");
-    }
-
-    if (isGithubCredentials(credentials)) {
-      return uploadGithubSnapshotFile(credentials, filePath, plain, afterRead, mimeType, plainSha256, pending);
-    }
-
-    try {
-      const existingRemoteImage = (await listRemoteImages(credentials)).find((image) => (
-        image.sha256 === plainSha256 && image.plainSize === plain.length
-      ));
-      if (existingRemoteImage) {
-        rememberUploadedFile(filePath, afterRead, plainSha256, existingRemoteImage);
-        removePendingUpload(filePath);
-        return existingRemoteImage;
-      }
-    } catch (error) {
-      console.warn("Unable to check existing remote photos", error);
-    }
-
-    const imageId = pending.imageId ?? randomUUID();
-    const nonce = pending.nonce ? decodeBase64Url(pending.nonce) : randomBytes(12);
-    if (nonce.length !== 12) {
-      throw new Error("上传队列中的加密随机数无效，请重试这张照片");
-    }
-    if (!pending.nonce) {
-      rememberPendingNonce(filePath, encodeBase64Url(nonce));
-    }
-    const key = decodeBase64Url(credentials.roomKey);
-    const aad = Buffer.from(`${credentials.channelId}:${imageId}:${TRANSFER_PROTOCOL_VERSION}`, "utf8");
-    const cipher = createCipheriv("aes-256-gcm", key, nonce);
-    cipher.setAAD(aad);
-    const encrypted = Buffer.concat([cipher.update(plain), cipher.final(), cipher.getAuthTag()]);
-    const response = await requestTransfer(`/v1/channel/${encodeURIComponent(credentials.channelId)}/images`, {
-      method: "POST",
-      headers: getTransferAuthHeaders(credentials.ownerToken, {
-        "Content-Type": "application/octet-stream",
-        "X-Image-Id": imageId,
-        "X-Nonce": encodeBase64Url(nonce),
-        "X-Mime-Type": mimeType,
-        "X-Plain-Size": String(plain.length),
-        "X-Plain-Sha256": plainSha256,
-        "X-Protocol-Version": TRANSFER_PROTOCOL_VERSION,
-        "X-Created-At": pending.createdAt,
-      }),
-      body: encrypted,
-    }, credentials.ownerToken);
-    const result = await response.json() as RemoteImage;
-    const savedImage: RemoteImage = {
-      ...result,
-      plainSize: result.plainSize ?? plain.length,
-      sha256: result.sha256 ?? plainSha256,
+      nonce: previous.image.nonce,
     };
-    rememberUploadedFile(filePath, afterRead, plainSha256, savedImage);
-    rememberRemoteImage(credentials, savedImage);
-    removePendingUpload(filePath);
-    return savedImage;
-  } catch (error) {
-    throw error;
+    return await uploadGithubSnapshotFile(credentials, filePath, plain, afterStat, mimeType, plainSha256, recoveredPending);
   }
-}
 
+  const plain = await fs.promises.readFile(filePath);
+  const afterRead = await fs.promises.stat(filePath);
+  if (beforeRead.size !== afterRead.size || Math.abs(beforeRead.mtimeMs - afterRead.mtimeMs) > 2) {
+    throw new Error("照片仍在写入，稍后会自动重试");
+  }
+  if (plain.length > MAX_TRANSFER_BYTES) {
+    throw new Error("照片超过手机收图的大小限制");
+  }
+  const plainSha256 = createHash("sha256").update(plain).digest("hex");
+  const pending = upsertPendingUpload(filePath, {
+    size: plain.length,
+    mtimeMs: afterRead.mtimeMs,
+    sha256: plainSha256,
+    mimeType,
+    createdAt: getCaptureTimestamp(filePath, afterRead),
+  });
+  return await uploadGithubSnapshotFile(credentials, filePath, plain, afterRead, mimeType, plainSha256, pending);
+}
 async function uploadSnapshotFile(filePath: string): Promise<RemoteImage> {
   const normalizedPath = normalizeFilePath(filePath);
   const currentUpload = inFlightUploads.get(normalizedPath);
@@ -1300,7 +2025,12 @@ async function uploadSnapshotFile(filePath: string): Promise<RemoteImage> {
   const resolvedPath = path.resolve(filePath);
   const trackedUpload = uploadSnapshotFileInternal(resolvedPath)
     .catch((error) => {
-      if (markPendingUploadFailure(resolvedPath, error)) {
+      let queued = markPendingUploadFailure(resolvedPath, error);
+      if (!queued && isRetryableLocalUploadError(error)) {
+        enqueuePendingUploadPlaceholder(resolvedPath);
+        queued = markPendingUploadFailure(resolvedPath, error);
+      }
+      if (queued) {
         schedulePendingUploadRetry();
         throw new Error(`照片已保存在本机，发送失败并已加入后台重试：${transferErrorMessage(error)}`);
       }
@@ -1319,6 +2049,7 @@ async function retryPendingUploads(): Promise<TransferRetryResult> {
   if (pendingUploadRetryPromise) {
     return pendingUploadRetryPromise;
   }
+  clearPendingUploadRetryTimer();
 
   const task = (async (): Promise<TransferRetryResult> => {
     const queue = readPendingUploads();
@@ -1342,11 +2073,17 @@ async function retryPendingUploads(): Promise<TransferRetryResult> {
         lastError = transferErrorMessage(error);
       }
     }
+    const backupResult = await retryPendingGithubBackups(true);
+    const remainingUploads = readPendingUploads().length;
     return {
-      sent,
-      failed,
-      remaining: readPendingUploads().length,
-      ...(lastError ? { lastError } : {}),
+      sent: sent + backupResult.sent,
+      failed: failed + backupResult.failed,
+      remaining: remainingUploads + backupResult.remaining,
+      sentBackups: backupResult.sent,
+      failedBackups: backupResult.failed,
+      remainingBackups: backupResult.remaining,
+      ...(lastError || backupResult.lastError ? { lastError: lastError ?? backupResult.lastError } : {}),
+      ...(backupResult.lastError ? { lastBackupError: backupResult.lastError } : {}),
     };
   })();
   pendingUploadRetryPromise = task;
@@ -1404,7 +2141,7 @@ function schedulePendingUploadRetry(delayMs = pendingUploadRetryDelayMs()): void
 
 async function runSnapshotFolderSync(): Promise<void> {
   const credentials = readTransferCredentials();
-  if (!credentials || (!isGithubCredentials(credentials) && !TRANSFER_API_BASE_URL)) {
+  if (!isGithubCredentials(credentials)) {
     return;
   }
 
@@ -1770,7 +2507,7 @@ app.whenReady().then(() => {
       return;
     }
     // Initialize the GitHub relay before watching the photo folder. Existing
-    // Cloudflare credentials are migrated on this first run so the phone keeps
+    // Legacy photo credentials are migrated on this first run so the phone keeps
     // seeing the old history under the same channel key.
     void ensureTransferChannel()
       .catch((error) => {
@@ -1800,6 +2537,7 @@ app.on("window-all-closed", () => {
 
 app.on("before-quit", () => {
   isQuitting = true;
+  clearGithubBackupRetryTimer();
   if (backgroundStartupTimer) {
     clearTimeout(backgroundStartupTimer);
     backgroundStartupTimer = null;

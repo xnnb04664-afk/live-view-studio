@@ -61,6 +61,8 @@ const DEFAULT_DOCK_BUTTON_SCALE = 1;
 const CAPTURE_ENDED_RECOVERY_DELAY_MS = 800;
 const CAPTURE_HEALTH_CHECK_INTERVAL_MS = 2_000;
 const CAPTURE_UNHEALTHY_GRACE_MS = 4_000;
+const CAPTURE_RETRY_INITIAL_DELAY_MS = 2_000;
+const CAPTURE_RETRY_MAX_DELAY_MS = 30_000;
 
 type DockPosition = "bottom" | "top" | "left" | "right";
 type DockButtonId = "reset" | "fullscreen" | "alwaysOnTop" | "refresh" | "camera" | "microphone" | "mirror" | "folder";
@@ -189,14 +191,14 @@ function getErrorMessage(error: unknown): { title: string; detail: string; permi
   if (name === "NotFoundError") {
     return {
       title: t("没有找到设备"),
-      detail: t("请连接摄像头或麦克风后点击重试。"),
+      detail: t("连接设备后，应用会自动重试，也可手动重试。"),
       permissionDenied: false,
     };
   }
   if (name === "NotReadableError" || name === "AbortError") {
     return {
       title: t("设备正在被占用"),
-      detail: t("请关闭其他正在使用此设备的软件，然后重试。"),
+      detail: t("关闭占用设备的软件后，应用会自动重试。"),
       permissionDenied: false,
     };
   }
@@ -349,6 +351,7 @@ function ToggleRow({
 function TransferDialog({
   state,
   isLoading,
+  isRetryingUploads,
   onClose,
   onEnsure,
   onReset,
@@ -357,6 +360,7 @@ function TransferDialog({
 }: {
   state: TransferChannelState | null;
   isLoading: boolean;
+  isRetryingUploads: boolean;
   onClose: () => void;
   onEnsure: () => void;
   onReset: () => void;
@@ -367,6 +371,12 @@ function TransferDialog({
   const pairingPayloads = state?.pairingPayloads ?? (state?.pairingPayload ? [state.pairingPayload] : []);
   const hasPairingKeys = pairingPayloads.length > 0;
   const isGithub = state?.backend === "github";
+  const pendingUploads = state?.pendingUploads ?? 0;
+  const isLegacyMigrationBlocked = Boolean(
+    isGithub
+    && state?.status === "offline"
+    && state.lastError?.startsWith("旧 ECS 照片迁移到 GitHub 尚未完成"),
+  );
 
   const copyPairingKey = useCallback(async (payload: string, index: number) => {
     try {
@@ -385,7 +395,13 @@ function TransferDialog({
     window.setTimeout(() => setCopiedKeyIndex(null), 1800);
   }, []);
 
-  const statusLabel = isGithub
+  const statusLabel = isLegacyMigrationBlocked
+    ? t("旧照片迁移尚未完成")
+    : isGithub && !hasPairingKeys
+    ? t("手机只读权限未配置")
+    : isGithub && state?.status === "offline"
+    ? t("GitHub 暂时无法连接")
+    : isGithub
     ? t("GitHub 私有中转已就绪")
     : hasPairingKeys
     ? state?.receiverCount
@@ -406,19 +422,23 @@ function TransferDialog({
           <div>
             <div className="eyebrow">PRIVATE LINK / MOBILE</div>
             <h2 id="transfer-title">{t("手机收图")}</h2>
-            <p>{t("这是一条只给你的私有通道，照片会先加密，再写入你的 GitHub 私有仓库。")}</p>
+            <p>{t("照片会先在桌面端加密，再上传到私有中转；只有手机能用连接密钥解密。")}</p>
           </div>
           <button className="settings-close" type="button" onClick={onClose} aria-label={t("关闭手机收图")}><Icon name="close" size={18} /></button>
         </header>
 
         <div className="transfer-body">
           <div className={`transfer-state transfer-state-${state?.status ?? "loading"}`}>
-            <span className="transfer-state-icon"><Icon name={hasPairingKeys ? "link" : state?.status === "paired" ? "phone" : state?.status === "offline" ? "alert" : "link"} size={20} /></span>
+            <span className="transfer-state-icon"><Icon name={state?.status === "offline" ? "alert" : hasPairingKeys ? "link" : state?.status === "paired" ? "phone" : "link"} size={20} /></span>
             <div>
               <strong>{isLoading && !state ? t("正在检查通道") : t(statusLabel)}</strong>
               <span>
-                {isGithub
-                  ? t("把同一条密钥粘贴到手机端；手机会自动从私有仓库同步照片")
+                {isGithub && !hasPairingKeys
+                  ? state?.lastError ?? t("请配置手机只读令牌后生成连接密钥")
+                  : isGithub && state?.status === "offline"
+                  ? state.lastError ?? t("检查网络后可以重试发送")
+                  : isGithub
+                  ? t("把这条密钥复制到手机端；手机从 GitHub 私有仓库同步照片。旧服务器通道需要重新绑定。")
                   : hasPairingKeys
                   ? t("复制对应密钥到手机；每条密钥只能绑定一台手机")
                   : state?.status === "paired"
@@ -435,8 +455,20 @@ function TransferDialog({
             <div className="transfer-empty">
               <div className="transfer-empty-mark"><Icon name="cloud" size={26} /></div>
               <strong>{t("创建你的私有收图通道")}</strong>
-              <p>{t("创建后会生成一条连接密钥。桌面端会自动同步照片保存位置中的图片，GitHub 只保存密文。")}</p>
+              <p>{t("创建后会生成连接密钥。照片在桌面端加密后同步到你的 GitHub 私有仓库。")}</p>
               <button className="transfer-primary" type="button" onClick={onEnsure} disabled={isLoading}>{t("创建通道")}</button>
+            </div>
+          ) : isLegacyMigrationBlocked ? (
+            <div className="transfer-empty">
+              <div className="transfer-empty-mark"><Icon name="alert" size={26} /></div>
+              <strong>{t("旧照片迁移尚未完成")}</strong>
+              <p>{state?.lastError}</p>
+            </div>
+          ) : isGithub && !hasPairingKeys ? (
+            <div className="transfer-empty">
+              <div className="transfer-empty-mark"><Icon name="lock" size={26} /></div>
+              <strong>{t("手机连接密钥暂不可用")}</strong>
+              <p>{state?.lastError ?? t("请配置手机只读令牌后生成连接密钥")}</p>
             </div>
           ) : pairingPayloads.length > 0 ? (
             <div className="transfer-pairing">
@@ -465,14 +497,30 @@ function TransferDialog({
             <div className="transfer-paired">
               <div className="transfer-paired-orbit"><Icon name="phone" size={30} /></div>
               <strong>{t(`已绑定 ${state?.receiverCount ?? 0} 台手机`)}</strong>
-              <span>{t("照片保存位置中的图片会自动上传，手机会从 GitHub 私有仓库同步，确认后再保存到相册。")}</span>
+              <span>{t("照片会加密后同步到 GitHub 私有仓库；手机可以浏览照片，并确认后再保存到相册。")}</span>
               <div className="transfer-paired-meta"><span>{t("已收照片")}</span><strong>{state?.imageCount ?? 0}</strong></div>
             </div>
           )}
 
-          {state?.pendingUploads ? (
-            <div className="transfer-pending"><span><Icon name="alert" size={15} />{state.pendingUploads} {t("张照片等待发送")}</span><button type="button" onClick={onRetry}>{t("重试发送")}</button></div>
+          {pendingUploads ? (
+            <div className="transfer-pending">
+              <div className="transfer-pending-copy">
+                <span>
+                  <Icon name="alert" size={15} />
+                  {isRetryingUploads
+                    ? t("正在发送待处理照片…")
+                    : `${pendingUploads} ${t("张照片等待发送")}`}
+                </span>
+                {!isRetryingUploads && state?.lastUploadError
+                  ? <small>{t("上次失败：")}{state.lastUploadError}</small>
+                  : null}
+              </div>
+              <button type="button" onClick={onRetry} disabled={isRetryingUploads}>
+                {isRetryingUploads ? t("正在发送…") : t("重试发送")}
+              </button>
+            </div>
           ) : null}
+
         </div>
 
         <footer className="transfer-footer">
@@ -511,6 +559,7 @@ export default function App() {
   const [isTransferOpen, setIsTransferOpen] = useState(false);
   const [transferState, setTransferState] = useState<TransferChannelState | null>(null);
   const [isTransferLoading, setIsTransferLoading] = useState(false);
+  const [isRetryingUploads, setIsRetryingUploads] = useState(false);
   const [isMaximized, setIsMaximized] = useState(false);
   const [isAlwaysOnTop, setIsAlwaysOnTop] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
@@ -525,9 +574,12 @@ export default function App() {
   const captureRequestIdRef = useRef(0);
   const captureRestartingRef = useRef(false);
   const captureRecoveryTimerRef = useRef<number | null>(null);
+  const captureRetryAttemptsRef = useRef(0);
+  const scheduleCaptureRecoveryRef = useRef<(delay?: number) => void>(() => undefined);
   const captureUnhealthySinceRef = useRef<number | null>(null);
   const hasHadLiveCameraRef = useRef(false);
   const captureRecoveryBlockedRef = useRef(false);
+  const captureReplacementPendingRef = useRef(false);
   const captureMountedRef = useRef(true);
 
   const cameraDevices = useMemo(() => devices.filter((device) => device.kind === "videoinput"), [devices]);
@@ -649,14 +701,14 @@ export default function App() {
   }, [showToast]);
 
   const resetTransferPairing = useCallback(async () => {
-    if (!window.desktop?.transfer || !window.confirm(t("重新绑定会让当前连接密钥失效，并生成一条新的 GitHub 密钥，确定继续吗？"))) {
+    if (!window.desktop?.transfer || !window.confirm(t("重置会让当前连接密钥失效，需要在手机端重新绑定，确定继续吗？"))) {
       return;
     }
     setIsTransferLoading(true);
     try {
       const state = await window.desktop.transfer.resetPairing();
       setTransferState(state);
-      showToast("连接密钥已重置", t("请把新的 GitHub 密钥填入手机端"));
+      showToast("连接密钥已重置", t(state.backend === "github" ? "请把新的 GitHub 密钥填入手机端" : "请把新的连接密钥填入手机端"));
     } catch (error) {
       showToast("配对重置失败", error instanceof Error ? error.message : t("无法重置配对"), "warning");
     } finally {
@@ -665,20 +717,30 @@ export default function App() {
   }, [showToast]);
 
   const retryTransferUploads = useCallback(async () => {
-    if (!window.desktop?.transfer) {
+    if (!window.desktop?.transfer || isRetryingUploads) {
       return;
     }
-    setIsTransferLoading(true);
+    setIsRetryingUploads(true);
+    showToast("正在重试发送", "正在尝试发送待处理照片，网络较慢时可能需要一点时间。");
     try {
       const result = await window.desktop.transfer.retryPendingUploads();
-      await refreshTransferState();
-      showToast(result.failed ? t("部分照片仍未发送") : t("待发送照片已完成"), result.failed ? t(`${result.sent} 张成功，${result.failed} 张待重试`) : t(`已发送 ${result.sent} 张照片`), result.failed ? "warning" : "success");
+      const hasFailures = result.failed > 0 || result.remaining > 0;
+      setTransferState((current) => current ? {
+        ...current,
+        pendingUploads: result.remaining,
+        ...(result.lastError ? { lastUploadError: result.lastError } : {}),
+      } : current);
+      const detail = hasFailures
+        ? `${result.sent} 张已发送，${result.remaining} 张待重试${result.lastError ? `；${result.lastError}` : ""}`
+        : `已发送 ${result.sent} 张照片`;
+      showToast(hasFailures ? "部分照片仍待处理" : "照片同步已完成", detail, hasFailures ? "warning" : "success");
+      void refreshTransferState();
     } catch (error) {
       showToast("重试发送失败", error instanceof Error ? error.message : t("无法重试发送"), "warning");
     } finally {
-      setIsTransferLoading(false);
+      setIsRetryingUploads(false);
     }
-  }, [refreshTransferState, showToast]);
+  }, [isRetryingUploads, refreshTransferState, showToast]);
 
   const updateCapture = useCallback((patch: Partial<CaptureState>) => {
     const next = { ...captureRef.current, ...patch };
@@ -809,7 +871,7 @@ export default function App() {
     return { stream: nextStream, issues, startMicrophone };
   }, [requestSingleTrack, stopStream]);
 
-  const restartCapture = useCallback(async (overrides: Partial<CaptureState> = {}) => {
+  const restartCapture = useCallback(async (overrides: Partial<CaptureState> = {}, automaticRetry = false) => {
     if (!navigator.mediaDevices?.getUserMedia) {
       captureRecoveryBlockedRef.current = true;
       setIssues([{
@@ -823,6 +885,9 @@ export default function App() {
     }
 
     clearCaptureRecoveryTimer();
+    if (!automaticRetry) {
+      captureRetryAttemptsRef.current = 0;
+    }
     const requestId = ++captureRequestIdRef.current;
     const nextState = { ...captureRef.current, ...overrides };
     captureRestartingRef.current = true;
@@ -838,17 +903,45 @@ export default function App() {
       }
 
       const previous = streamRef.current;
+      const acquiredCameraTrack = result.stream.getVideoTracks().find((track) => track.readyState === "live");
+      const previousCameraTrack = previous?.getVideoTracks().find((track) => track.readyState === "live") ?? null;
+      const preservePreviousCamera = Boolean(nextState.cameraEnabled && !acquiredCameraTrack && previousCameraTrack);
+      if (preservePreviousCamera && previousCameraTrack) {
+        result.stream.addTrack(previousCameraTrack);
+        const previousDeviceId = previousCameraTrack.getSettings().deviceId;
+        captureReplacementPendingRef.current = Boolean(nextState.cameraId && previousDeviceId && nextState.cameraId !== previousDeviceId);
+      } else {
+        captureReplacementPendingRef.current = false;
+      }
       streamRef.current = result.stream;
       setStream(result.stream);
       setMicrophoneTrack(result.stream.getAudioTracks()[0] ?? null);
-      stopStream(previous);
+      const retainedTracks = new Set(result.stream.getTracks());
+      previous?.getTracks().forEach((track) => {
+        if (retainedTracks.has(track)) {
+          previous.removeTrack(track);
+        } else {
+          track.stop();
+        }
+      });
       setIssues(result.issues);
       const liveCameraTrack = result.stream.getVideoTracks().some((track) => track.readyState === "live");
       if (liveCameraTrack) {
         hasHadLiveCameraRef.current = true;
+        captureRetryAttemptsRef.current = 0;
         captureUnhealthySinceRef.current = null;
       }
-      captureRecoveryBlockedRef.current = result.issues.some((issue) => issue.target === "camera" && issue.permissionDenied);
+      const cameraIssue = result.issues.find((issue) => issue.target === "camera");
+      captureRecoveryBlockedRef.current = Boolean(cameraIssue?.permissionDenied);
+      const unmutedCameraTrack = result.stream.getVideoTracks().some((track) => track.readyState === "live" && !track.muted);
+      if (nextState.cameraEnabled && (!unmutedCameraTrack || captureReplacementPendingRef.current) && !cameraIssue?.permissionDenied) {
+        const retryDelay = Math.min(
+          CAPTURE_RETRY_INITIAL_DELAY_MS * 2 ** captureRetryAttemptsRef.current,
+          CAPTURE_RETRY_MAX_DELAY_MS,
+        );
+        captureRetryAttemptsRef.current += 1;
+        scheduleCaptureRecoveryRef.current(retryDelay);
+      }
 
       // The preview is usable now. Complete audio and device-list work without
       // competing with the camera's first frame or holding its loading state open.
@@ -912,6 +1005,14 @@ export default function App() {
       const message = getErrorMessage(error);
       captureRecoveryBlockedRef.current = message.permissionDenied;
       setIssues([{ target: "camera", ...message }]);
+      if (!message.permissionDenied && captureRef.current.cameraEnabled) {
+        const retryDelay = Math.min(
+          CAPTURE_RETRY_INITIAL_DELAY_MS * 2 ** captureRetryAttemptsRef.current,
+          CAPTURE_RETRY_MAX_DELAY_MS,
+        );
+        captureRetryAttemptsRef.current += 1;
+        scheduleCaptureRecoveryRef.current(retryDelay);
+      }
     } finally {
       if (requestId === captureRequestIdRef.current) {
         captureRestartingRef.current = false;
@@ -929,13 +1030,21 @@ export default function App() {
     captureRecoveryTimerRef.current = window.setTimeout(() => {
       captureRecoveryTimerRef.current = null;
       const currentTrack = streamRef.current?.getVideoTracks().find((track) => track.readyState === "live" && !track.muted);
-      if (!captureMountedRef.current || !captureRef.current.cameraEnabled || currentTrack || captureRestartingRef.current) {
+      if (!captureMountedRef.current || !captureRef.current.cameraEnabled || (currentTrack && !captureReplacementPendingRef.current)) {
+        return;
+      }
+      if (captureRestartingRef.current) {
+        scheduleCaptureRecovery(1_000);
         return;
       }
       captureUnhealthySinceRef.current = Date.now();
-      void restartCapture();
+      void restartCapture({}, true);
     }, delay);
   }, [restartCapture]);
+
+  useEffect(() => {
+    scheduleCaptureRecoveryRef.current = scheduleCaptureRecovery;
+  }, [scheduleCaptureRecovery]);
 
   const retryCapture = useCallback(() => {
     void restartCapture();
@@ -947,7 +1056,13 @@ export default function App() {
     const handleDeviceChange = () => {
       void refreshDevices()
         .catch(() => undefined)
-        .finally(() => scheduleCaptureRecovery());
+        .finally(() => {
+          const currentTrack = streamRef.current?.getVideoTracks().find((track) => track.readyState === "live" && !track.muted);
+          if (!currentTrack && captureRef.current.cameraEnabled) {
+            clearCaptureRecoveryTimer();
+            scheduleCaptureRecovery();
+          }
+        });
     };
     navigator.mediaDevices?.addEventListener("devicechange", handleDeviceChange);
     return () => {
@@ -1530,7 +1645,7 @@ export default function App() {
               <div className="empty-view">
                 <div className="empty-orbit"><Icon name={capture.cameraEnabled ? "cameraOff" : "camera"} size={25} /></div>
                 <strong>{isLoading ? t("正在准备取景") : capture.cameraEnabled ? t("没有可用画面") : t("摄像头已关闭")}</strong>
-                <span>{isLoading ? t("正在请求设备权限…") : t(primaryIssue?.detail ?? "点击下方按钮重新开启摄像头")}</span>
+                <span>{isLoading ? t("正在请求设备权限…") : t(primaryIssue?.detail ?? "设备可用后，应用会自动重试，也可手动重试")}</span>
                 {capture.cameraEnabled ? (
                   <button className="retry-device-button" type="button" onClick={retryCapture} disabled={isLoading}>
                     <Icon name="refresh" size={15} />{isLoading ? t("正在重试…") : t("重新尝试")}
@@ -1735,6 +1850,7 @@ export default function App() {
         <TransferDialog
           state={transferState}
           isLoading={isTransferLoading}
+          isRetryingUploads={isRetryingUploads}
           onClose={() => setIsTransferOpen(false)}
           onEnsure={() => void ensureTransferChannel()}
           onReset={() => void resetTransferPairing()}

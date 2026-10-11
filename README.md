@@ -1,6 +1,6 @@
 # 取景台 · Live View Studio
 
-[中文](#中文) · [English](#english) · [Project website](https://xnnb04664-afk.github.io/live-view-studio/) · [下载 Windows 安装包](https://github.com/xnnb04664-afk/live-view-studio/releases/latest/download/LiveViewStudio-Setup-0.1.2.exe) · [Download installer](https://github.com/xnnb04664-afk/live-view-studio/releases/latest/download/LiveViewStudio-Setup-0.1.2.exe)
+[中文](#中文) · [English](#english) · [Project website](https://xnnb04664-afk.github.io/live-view-studio/) · [下载 Windows 安装包](https://github.com/xnnb04664-afk/live-view-studio/releases/latest/download/LiveViewStudio-Setup-0.1.4.exe) · [Download installer](https://github.com/xnnb04664-afk/live-view-studio/releases/latest/download/LiveViewStudio-Setup-0.1.4.exe)
 
 Windows 摄像头取景与拍照桌面应用。实时预览、镜像、缩放和平移都在本机完成；可选手机收图通道会在上传前使用 AES-256-GCM 加密照片。
 
@@ -30,18 +30,19 @@ npm run dist
 
 安装包写入 `release-electron-restored/`。打包产物和本地依赖不会提交到 Git。
 
-### 可选：配置手机收图
+### 可选：配置手机收图与 GitHub 私有中转
 
-手机收图使用你自己的 GitHub 私有仓库。首次创建通道前，在启动应用的 PowerShell 会话中设置仓库信息与令牌；令牌建议使用仅对该私有仓库开放 Contents 读写权限的 fine-grained token。不要把令牌提交到仓库或写进 README。
+手机收图使用你自己的 GitHub 私有仓库中转。桌面端在本机先用 AES-256-GCM 加密原图和预览，再直接上传密文；手机端通过桌面生成的只读连接密钥下载照片。首次创建通道前，在启动应用的 PowerShell 会话中设置仓库信息与令牌；令牌建议使用仅对该私有仓库开放 Contents 读写权限的 fine-grained token。不要把令牌提交到仓库或写进 README。
 
 ```powershell
 $env:GITHUB_TRANSFER_OWNER = "your-github-name"
 $env:GITHUB_TRANSFER_REPO = "your-private-photo-repo"
 $env:GITHUB_TRANSFER_TOKEN = "your-fine-grained-token"
+$env:GITHUB_TRANSFER_READ_TOKEN = "your-read-only-token"
 npm run dev
 ```
 
-照片默认保存在 `D:\照片传送`，也可在桌面应用设置中选择其他文件夹；更改位置不会移动已有照片。启用手机收图后，保存目录中的图片会自动同步。GitHub 中转仅保存 AES-256-GCM 加密后的照片；请自行管理仓库访问权限和令牌。旧 Cloudflare 通道迁移是可选配置，默认不会连接任何个人服务。
+`GITHUB_TRANSFER_READ_TOKEN` 是手机连接密钥使用的令牌，必须对该私有仓库仅授予 Contents 只读权限；桌面端的写入令牌不会放进手机连接密钥。照片默认保存在 `D:\照片传送`，也可在桌面应用设置中选择其他文件夹；更改位置不会移动已有照片。桌面端直接向私有 GitHub 仓库上传加密原图、预览和清单；手机端直接从同一仓库读取，照片不经过 ECS。GitHub 仓库保留归档副本。清单包含拍摄时间、文件类型、尺寸和哈希等元数据。旧桌面通道若仍有已保存的 GitHub 备份凭据，会在启动时核对历史照片后切换为 GitHub 主通道；不要在迁移核对完成前删除唯一的数据副本。请自行管理仓库访问权限和令牌。
 
 ### 仓库范围
 
@@ -69,18 +70,21 @@ npm run dev
 
 Build a Windows x64 installer with `npm run dist`. Generated installers and build output are intentionally excluded from Git.
 
-### Optional phone transfer
+### Optional phone transfer through a private GitHub repository
 
-Phone transfer uses your own private GitHub repository. Set the repository and token in the PowerShell session that launches the app. Use a fine-grained token limited to Contents read/write access for that private repository, and never commit it.
+Phone transfer uses your own private GitHub repository directly. The desktop encrypts the original photo and preview with AES-256-GCM before upload; the phone reads the ciphertext through the desktop-generated read-only pairing key. Set the repository and token in the PowerShell session that launches the app. Use a fine-grained token limited to Contents read/write access for that private repository, and never commit it.
 
 ```powershell
 $env:GITHUB_TRANSFER_OWNER = "your-github-name"
 $env:GITHUB_TRANSFER_REPO = "your-private-photo-repo"
 $env:GITHUB_TRANSFER_TOKEN = "your-fine-grained-token"
+$env:GITHUB_TRANSFER_READ_TOKEN = "your-read-only-token"
 npm run dev
 ```
 
-Photos are saved locally to `D:\照片传送` by default; choose another folder in the desktop app settings if you prefer. Changing the location does not move existing photos. When phone transfer is enabled, images in the selected folder are synced automatically. The GitHub relay stores AES-256-GCM-encrypted photos only. You remain responsible for repository access and token management. Legacy Cloudflare migration is optional and no personal service endpoint is enabled by default.
+Set `GITHUB_TRANSFER_READ_TOKEN` to a separate fine-grained token with **Contents: read-only** access to that one repository. The desktop keeps its write token private and places only this read-only token in the phone pairing key. Restart the desktop app after setting it, then bind the phone with the pairing key shown by the desktop. The Android app stores that key in encrypted Keystore-backed storage. The phone reads photos directly from GitHub; it does not send photo traffic through the ECS.
+
+Photos are saved locally to `D:\照片传送` by default; choose another folder in the desktop app settings if you prefer. Changing the location does not move existing photos. The desktop uploads encrypted photos, previews, and a manifest directly to GitHub. The manifest contains capture time, media type, size, and hash metadata. You remain responsible for repository access and token management. Existing ECS photo channels are only read during one-time migration and are never used for new uploads.
 
 ### Repository scope
 

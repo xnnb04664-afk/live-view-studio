@@ -54,6 +54,9 @@ export type RemoteImage = {
 export type TransferChannelState = {
   status: TransferStatus;
   backend?: "cloudflare" | "github";
+  githubBackupEnabled?: boolean;
+  githubBackupPhoneEnabled?: boolean;
+  pendingBackups?: number;
   channelId: string | null;
   pairingPayload: string | null;
   pairingPayloads: string[];
@@ -66,6 +69,7 @@ export type TransferChannelState = {
   pendingUploads: number;
   lastError?: string;
   lastUploadError?: string;
+  lastBackupError?: string;
   retryScheduledAt?: string;
 };
 
@@ -73,7 +77,11 @@ export type TransferRetryResult = {
   sent: number;
   failed: number;
   remaining: number;
+  sentBackups: number;
+  failedBackups: number;
+  remainingBackups: number;
   lastError?: string;
+  lastBackupError?: string;
 };
 
 export type PrivacyTarget = "camera" | "microphone";
