@@ -8,6 +8,7 @@ const GITHUB_READ_TIMEOUT_MS = 20_000;
 const GITHUB_WRITE_TIMEOUT_MS = 60_000;
 const GITHUB_MAX_RETRY_DELAY_MS = 15_000;
 const GITHUB_MANIFEST_CONFLICT_ATTEMPTS = 5;
+const GITHUB_BATCH_BLOB_CONCURRENCY = 2;
 
 class GithubApiError extends Error {
   constructor(
@@ -62,9 +63,14 @@ function encodePath(pathname: string): string {
   return pathname.split("/").map((segment) => encodeURIComponent(segment)).join("/");
 }
 
-function contentUrl(credentials: GithubTransferCredentials, filePath: string, includeBranch = true): string {
+function contentUrl(
+  credentials: GithubTransferCredentials,
+  filePath: string,
+  includeBranch = true,
+  ref = credentials.githubBranch,
+): string {
   const base = `${GITHUB_API_BASE_URL}/repos/${encodeURIComponent(credentials.githubOwner)}/${encodeURIComponent(credentials.githubRepo)}/contents/${encodePath(filePath)}`;
-  return includeBranch ? `${base}?ref=${encodeURIComponent(credentials.githubBranch)}` : base;
+  return includeBranch ? `${base}?ref=${encodeURIComponent(ref)}` : base;
 }
 
 function repositoryUrl(credentials: GithubTransferCredentials, pathname: string): string {
@@ -82,6 +88,23 @@ function githubHeaders(credentials: GithubTransferCredentials, accept = "applica
 
 function wait(delayMs: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  mapItem: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(items.length, Math.max(1, concurrency));
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await mapItem(items[index], index);
+    }
+  }));
+  return results;
 }
 
 function repositoryWriteKey(credentials: GithubTransferCredentials): string {
@@ -110,14 +133,20 @@ async function withGithubWriteLock<T>(
   }
 }
 
-function isRetryableGithubResponse(response: Response): boolean {
+async function isRetryableGithubResponse(response: Response): Promise<boolean> {
   if ([408, 425, 429, 500, 502, 503, 504].includes(response.status)) {
     return true;
   }
-  return response.status === 403 && (
-    response.headers.has("retry-after")
-    || response.headers.get("x-ratelimit-remaining") === "0"
-  );
+  if (response.status !== 403) return false;
+  if (response.headers.has("retry-after") || response.headers.get("x-ratelimit-remaining") === "0") {
+    return true;
+  }
+  try {
+    const body = await response.clone().json() as { message?: string };
+    return /rate limit|abuse detection/i.test(body.message ?? "");
+  } catch {
+    return false;
+  }
 }
 
 function githubRetryDelayMs(response: Response | null, attempt: number): number {
@@ -125,22 +154,25 @@ function githubRetryDelayMs(response: Response | null, attempt: number): number 
   if (retryAfter) {
     const seconds = Number(retryAfter);
     if (Number.isFinite(seconds)) {
-      return Math.min(GITHUB_MAX_RETRY_DELAY_MS, Math.max(0, seconds * 1_000));
+      return Math.max(0, seconds * 1_000);
     }
     const retryAt = Date.parse(retryAfter);
     if (Number.isFinite(retryAt)) {
-      return Math.min(GITHUB_MAX_RETRY_DELAY_MS, Math.max(0, retryAt - Date.now()));
+      return Math.max(0, retryAt - Date.now());
     }
   }
 
   if (response?.headers.get("x-ratelimit-remaining") === "0") {
     const resetAt = Number(response.headers.get("x-ratelimit-reset"));
     if (Number.isFinite(resetAt)) {
-      return Math.min(GITHUB_MAX_RETRY_DELAY_MS, Math.max(0, resetAt * 1_000 - Date.now()));
+      return Math.max(0, resetAt * 1_000 - Date.now());
     }
   }
 
   const exponential = 600 * (2 ** attempt);
+  if (response?.status === 403 || response?.status === 429) {
+    return Math.max(60_000, exponential + Math.floor(Math.random() * 250));
+  }
   return Math.min(GITHUB_MAX_RETRY_DELAY_MS, exponential + Math.floor(Math.random() * 250));
 }
 
@@ -167,7 +199,7 @@ async function fetchGithub(input: string, init: RequestInit): Promise<Response> 
 
     try {
       const response = await fetch(input, { ...init, signal: controller.signal });
-      if (attempt < GITHUB_MAX_REQUEST_ATTEMPTS - 1 && isRetryableGithubResponse(response)) {
+      if (attempt < GITHUB_MAX_REQUEST_ATTEMPTS - 1 && await isRetryableGithubResponse(response)) {
         const delayMs = githubRetryDelayMs(response, attempt);
         await response.body?.cancel().catch(() => undefined);
         await wait(delayMs);
@@ -213,8 +245,9 @@ function isGithubWriteConflict(error: unknown): boolean {
 async function getFileMetadata(
   credentials: GithubTransferCredentials,
   filePath: string,
+  ref = credentials.githubBranch,
 ): Promise<GithubFileMetadata | null> {
-  const response = await fetchGithub(contentUrl(credentials, filePath), {
+  const response = await fetchGithub(contentUrl(credentials, filePath, true, ref), {
     headers: githubHeaders(credentials),
   });
   if (response.status === 404) {
@@ -229,8 +262,9 @@ async function getFileMetadata(
 async function readRawFile(
   credentials: GithubTransferCredentials,
   filePath: string,
+  ref = credentials.githubBranch,
 ): Promise<Buffer | null> {
-  const response = await fetchGithub(contentUrl(credentials, filePath), {
+  const response = await fetchGithub(contentUrl(credentials, filePath, true, ref), {
     headers: githubHeaders(credentials, "application/vnd.github.raw+json"),
   });
   if (response.status === 404) {
@@ -361,6 +395,28 @@ async function readGithubManifestSnapshot(
     // The Contents API omits inline content for larger files. The blob SHA is
     // still useful for compare-and-swap; a branch race will be retried below.
     bytes = await readRawFile(credentials, filePath);
+  }
+  if (!bytes) {
+    return { manifest: emptyManifest(credentials) };
+  }
+  return { manifest: parseGithubManifest(credentials, bytes), sha: metadata.sha };
+}
+
+async function readGithubManifestSnapshotAtRef(
+  credentials: GithubTransferCredentials,
+  ref: string,
+): Promise<GithubManifestSnapshot> {
+  const filePath = githubManifestPath(credentials);
+  const metadata = await getFileMetadata(credentials, filePath, ref);
+  if (!metadata) {
+    return { manifest: emptyManifest(credentials) };
+  }
+
+  let bytes: Buffer | null = null;
+  if (metadata.content && metadata.encoding === "base64") {
+    bytes = Buffer.from(metadata.content.replace(/\s/g, ""), "base64");
+  } else {
+    bytes = await readRawFile(credentials, filePath, ref);
   }
   if (!bytes) {
     return { manifest: emptyManifest(credentials) };
@@ -634,15 +690,13 @@ async function uploadGithubImagesBatchUnlocked(
     return manifest.images;
   }
 
-  const blobs = await Promise.all(pending.map(async ({ encrypted }) => await githubJsonRequest<GithubBlobResponse>(
-    credentials,
-    "git/blobs",
-    {
+  const blobs = await mapWithConcurrency(pending, GITHUB_BATCH_BLOB_CONCURRENCY, async ({ encrypted }) => (
+    await githubJsonRequest<GithubBlobResponse>(credentials, "git/blobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: encrypted.toString("base64"), encoding: "base64" }),
-    },
-  )));
+    })
+  ));
   const nextImages = [...pending.map(({ image }) => ({ ...image, storagePath: githubImagePath(credentials, image.id) })), ...manifest.images]
     .filter((image, index, all) => all.findIndex((candidate) => candidate.id === image.id) === index)
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
@@ -724,6 +778,246 @@ async function uploadGithubImagesBatchUnlocked(
   return nextImages;
 }
 
+export type GithubPhotoUploadBatchEntry = {
+  image: RemoteImage;
+  encrypted: Buffer;
+  preview?: GithubPreviewUpload;
+};
+
+type GithubPhotoBatchBlob = { path: string; bytes: Buffer };
+
+/**
+ * Store a small group of encrypted originals, their previews, and the manifest
+ * in one branch commit. The branch is updated with force=false and the pinned
+ * manifest is re-read after a conflict so concurrent writers are preserved.
+ */
+export async function uploadGithubPhotosBatch(
+  credentials: GithubTransferCredentials,
+  entries: GithubPhotoUploadBatchEntry[],
+): Promise<RemoteImage[]> {
+  if (entries.length === 0) return [];
+  const inputIds = new Set<string>();
+  for (const { image } of entries) {
+    if (inputIds.has(image.id)) {
+      throw new Error(`GitHub 批量上传包含重复照片编号：${image.id}`);
+    }
+    inputIds.add(image.id);
+  }
+  return await withGithubWriteLock(credentials, async () => {
+    const blobShas = new Map<string, string>();
+    let lastConflict: unknown;
+
+    for (let attempt = 0; attempt < GITHUB_MANIFEST_CONFLICT_ATTEMPTS; attempt += 1) {
+      const ref = await githubJsonRequest<GithubRefResponse>(
+        credentials,
+        `git/ref/heads/${credentials.githubBranch}`,
+      );
+      const snapshot = await readGithubManifestSnapshotAtRef(credentials, ref.object.sha);
+      const currentImages = snapshot.manifest.images;
+      const nextImages = currentImages.slice();
+      const imagesByHash = new Map<string, RemoteImage>();
+      for (const current of currentImages) {
+        if (current.sha256 && current.plainSize !== undefined) {
+          imagesByHash.set(`${current.sha256}:${current.plainSize}`, current);
+        }
+      }
+
+      const resultIdByInputId = new Map<string, string>();
+      const changed: Array<{
+        image: RemoteImage;
+        encrypted: Buffer;
+        preview?: GithubPreviewUpload;
+        uploadImage: boolean;
+        uploadPreview: boolean;
+      }> = [];
+
+      for (const entry of entries) {
+        const { image, preview } = entry;
+        const hashKey = image.sha256 ? `${image.sha256}:${image.plainSize}` : null;
+        const byIdIndex = nextImages.findIndex((candidate) => candidate.id === image.id);
+        const byId = byIdIndex >= 0 ? nextImages[byIdIndex] : undefined;
+        if (byId && ((byId.sha256 && image.sha256 && byId.sha256 !== image.sha256)
+          || (byId.plainSize !== undefined && byId.plainSize !== image.plainSize))) {
+          throw new Error("GitHub 清单中相同照片编号对应了不同内容");
+        }
+
+        const sameContent = hashKey ? imagesByHash.get(hashKey) : undefined;
+        if (!byId && sameContent) {
+          resultIdByInputId.set(image.id, sameContent.id);
+          if (preview && !sameContent.previewNonce) {
+            const previewStoragePath = githubPreviewPath(credentials, sameContent.id);
+            const previewForExisting = { ...preview, storagePath: previewStoragePath };
+            const nextImage: RemoteImage = {
+              ...sameContent,
+              previewSizeBytes: preview.sizeBytes,
+              previewMimeType: preview.mimeType,
+              previewNonce: preview.nonce,
+              previewPlainSize: preview.plainSize,
+              previewStoragePath,
+            };
+            const existingIndex = nextImages.findIndex((candidate) => candidate.id === sameContent.id);
+            if (existingIndex >= 0) nextImages[existingIndex] = nextImage;
+            changed.push({
+              image: nextImage,
+              encrypted: Buffer.alloc(0),
+              preview: previewForExisting,
+              uploadImage: false,
+              uploadPreview: true,
+            });
+            if (hashKey) imagesByHash.set(hashKey, nextImage);
+          }
+          continue;
+        }
+
+        const uploadImage = !byId || !byId.storagePath;
+        const uploadPreview = Boolean(preview && !byId?.previewNonce);
+        const nextImage: RemoteImage = {
+          ...(byId ?? image),
+          ...image,
+          storagePath: byId?.storagePath || image.storagePath || githubImagePath(credentials, image.id),
+          ...(byId?.previewNonce ? {
+            previewSizeBytes: byId.previewSizeBytes,
+            previewMimeType: byId.previewMimeType,
+            previewNonce: byId.previewNonce,
+            previewPlainSize: byId.previewPlainSize,
+            previewStoragePath: byId.previewStoragePath || githubPreviewPath(credentials, image.id),
+          } : preview ? {
+            previewSizeBytes: preview.sizeBytes,
+            previewMimeType: preview.mimeType,
+            previewNonce: preview.nonce,
+            previewPlainSize: preview.plainSize,
+            previewStoragePath: preview.storagePath,
+          } : {}),
+        };
+
+        const metadataChanged = !byId || JSON.stringify(nextImage) !== JSON.stringify(byId);
+        if (uploadImage || uploadPreview || metadataChanged) {
+          changed.push({ image: nextImage, encrypted: entry.encrypted, preview, uploadImage, uploadPreview });
+          if (byIdIndex >= 0) nextImages[byIdIndex] = nextImage;
+          else nextImages.unshift(nextImage);
+        }
+        resultIdByInputId.set(image.id, nextImage.id);
+        if (hashKey) imagesByHash.set(hashKey, nextImage);
+      }
+
+      if (changed.length === 0) {
+        const currentById = new Map(currentImages.map((image) => [image.id, image]));
+        return entries.map((entry) => currentById.get(resultIdByInputId.get(entry.image.id) ?? entry.image.id) ?? entry.image);
+      }
+
+      const blobsToCreate: GithubPhotoBatchBlob[] = [];
+      for (const item of changed) {
+        if (item.uploadImage) {
+          if (item.encrypted.length === 0) {
+            throw new Error(`GitHub 备用照片 ${item.image.id} 缺少原图密文`);
+          }
+          blobsToCreate.push({ path: item.image.storagePath || githubImagePath(credentials, item.image.id), bytes: item.encrypted });
+        }
+        if (item.uploadPreview && item.preview) {
+          blobsToCreate.push({ path: item.preview.storagePath, bytes: item.preview.encrypted });
+        }
+      }
+
+      const blobsByPath = new Map<string, GithubPhotoBatchBlob>();
+      for (const blob of blobsToCreate) {
+        const existing = blobsByPath.get(blob.path);
+        if (existing && !existing.bytes.equals(blob.bytes)) {
+          throw new Error(`GitHub 批量上传中同一路径对应了不同内容：${blob.path}`);
+        }
+        if (!existing) blobsByPath.set(blob.path, blob);
+      }
+      const uniqueBlobsToCreate = [...blobsByPath.values()];
+
+      const newBlobs = uniqueBlobsToCreate.filter(({ path: blobPath }) => !blobShas.has(blobPath));
+      const createdBlobs = await mapWithConcurrency(
+        newBlobs,
+        GITHUB_BATCH_BLOB_CONCURRENCY,
+        async ({ bytes }) => await githubJsonRequest<GithubBlobResponse>(credentials, "git/blobs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: bytes.toString("base64"), encoding: "base64" }),
+        }),
+      );
+      newBlobs.forEach(({ path: blobPath }, index) => blobShas.set(blobPath, createdBlobs[index].sha));
+
+      try {
+        const parentCommit = await githubJsonRequest<GithubCommitResponse>(
+          credentials,
+          `git/commits/${ref.object.sha}`,
+        );
+        const nextManifest: GithubManifest = {
+          ...snapshot.manifest,
+          version: 1,
+          protocolVersion: "1",
+          channelId: credentials.channelId,
+          updatedAt: new Date().toISOString(),
+          images: sortedImages(nextImages),
+        };
+        const manifestBlob = await githubJsonRequest<GithubBlobResponse>(credentials, "git/blobs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            content: Buffer.from(JSON.stringify(nextManifest, null, 2), "utf8").toString("base64"),
+            encoding: "base64",
+          }),
+        });
+        const tree = await githubJsonRequest<GithubTreeResponse>(credentials, "git/trees", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            base_tree: parentCommit.tree.sha,
+            tree: [
+              ...uniqueBlobsToCreate.map(({ path: blobPath }) => ({
+                path: blobPath,
+                mode: "100644",
+                type: "blob",
+                sha: blobShas.get(blobPath),
+              })),
+              {
+                path: githubManifestPath(credentials),
+                mode: "100644",
+                type: "blob",
+                sha: manifestBlob.sha,
+              },
+            ],
+          }),
+        });
+        const createdCommit = await githubJsonRequest<GithubCreatedCommitResponse>(credentials, "git/commits", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: `Add encrypted photos ${changed.length}`,
+            tree: tree.sha,
+            parents: [ref.object.sha],
+          }),
+        });
+        await githubJsonRequest<Record<string, unknown>>(
+          credentials,
+          `git/refs/heads/${credentials.githubBranch}`,
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sha: createdCommit.sha, force: false }),
+          },
+        );
+
+        const savedById = new Map(nextManifest.images.map((image) => [image.id, image]));
+        return entries.map((entry) => (
+          savedById.get(resultIdByInputId.get(entry.image.id) ?? entry.image.id) ?? entry.image
+        ));
+      } catch (error) {
+        if (!isGithubWriteConflict(error) || attempt === GITHUB_MANIFEST_CONFLICT_ATTEMPTS - 1) {
+          throw error;
+        }
+        lastConflict = error;
+        await wait(githubRetryDelayMs(null, attempt));
+      }
+    }
+
+    throw lastConflict instanceof Error ? lastConflict : new Error("GitHub 批量上传发生并发写入冲突");
+  });
+}
+
 /**
  * Backfill compressed encrypted previews for photos uploaded before preview
  * support. The preview blobs and manifest are committed together so the
@@ -752,15 +1046,13 @@ async function uploadGithubPreviewsBatchUnlocked(
     return manifest.images;
   }
 
-  const blobs = await Promise.all(pending.map(async ({ preview }) => await githubJsonRequest<GithubBlobResponse>(
-    credentials,
-    "git/blobs",
-    {
+  const blobs = await mapWithConcurrency(pending, GITHUB_BATCH_BLOB_CONCURRENCY, async ({ preview }) => (
+    await githubJsonRequest<GithubBlobResponse>(credentials, "git/blobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: preview.encrypted.toString("base64"), encoding: "base64" }),
-    },
-  )));
+    })
+  ));
   const previewsById = new Map(pending.map(({ image, preview }) => [image.id, preview]));
   const nextImages = manifest.images.map((image) => {
     const preview = previewsById.get(image.id);

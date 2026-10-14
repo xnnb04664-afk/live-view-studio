@@ -13,8 +13,10 @@ import {
   readGithubManifest,
   updateGithubManifestImages,
   uploadGithubImage,
+  uploadGithubPhotosBatch,
   uploadGithubPreviewsBatch,
   type GithubManifest,
+  type GithubPhotoUploadBatchEntry,
   type GithubPreviewUpload,
   type GithubTransferCredentials,
 } from "./github-transfer";
@@ -46,6 +48,9 @@ const PENDING_UPLOAD_RETRY_MAX_MS = 5 * 60_000;
 const BACKGROUND_START_DELAY_MS = 1_500;
 const PREVIEW_MAX_DIMENSION = 720;
 const PREVIEW_JPEG_QUALITY = 78;
+const GITHUB_PHOTO_BATCH_MAX_COUNT = 4;
+const GITHUB_PHOTO_BATCH_MAX_BYTES = 12 * 1024 * 1024;
+const GITHUB_PHOTO_BATCH_WAIT_MS = 300;
 const DEFAULT_SNAPSHOT_DIRECTORY = "D:\\照片传送";
 const SUPPORTED_IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".heif"]);
 const SNAPSHOT_FILE_STAMP_PATTERN = /^取景-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$/u;
@@ -73,6 +78,19 @@ let snapshotDirectoryOverrideLoaded = false;
 let snapshotFolderSyncStarted = false;
 let snapshotFolderSyncGeneration = 0;
 const inFlightUploads = new Map<string, Promise<RemoteImage>>();
+type PendingGithubPhotoBatchEntry = GithubPhotoUploadBatchEntry & {
+  resolve: (image: RemoteImage) => void;
+  reject: (error: unknown) => void;
+};
+type PendingGithubPhotoBatch = {
+  credentials: GithubTransferCredentials;
+  entries: PendingGithubPhotoBatchEntry[];
+  encryptedBytes: number;
+  timer: NodeJS.Timeout | null;
+  flushing: boolean;
+  flushRequested: boolean;
+};
+const pendingGithubPhotoBatches = new Map<string, PendingGithubPhotoBatch>();
 let remoteImagesCache: { channelId: string; expiresAt: number; images: RemoteImage[] } | null = null;
 let githubTokenCache: string | null = null;
 let githubPreviewRepairScheduledFor: string | null = null;
@@ -1856,6 +1874,121 @@ async function resetTransferPairing(): Promise<TransferChannelState> {
   return state;
 }
 
+function githubPhotoBatchKey(credentials: GithubTransferCredentials): string {
+  return [
+    credentials.githubOwner.toLowerCase(),
+    credentials.githubRepo.toLowerCase(),
+    credentials.githubBranch,
+    credentials.channelId,
+  ].join("/");
+}
+
+function scheduleGithubPhotoBatchFlush(batch: PendingGithubPhotoBatch): void {
+  if (batch.timer || batch.entries.length === 0) return;
+  batch.timer = setTimeout(() => {
+    batch.timer = null;
+    batch.flushRequested = true;
+    void flushGithubPhotoBatch(batch);
+  }, GITHUB_PHOTO_BATCH_WAIT_MS);
+}
+
+function takeGithubPhotoBatchEntries(batch: PendingGithubPhotoBatch): PendingGithubPhotoBatchEntry[] {
+  const selected: PendingGithubPhotoBatchEntry[] = [];
+  let encryptedBytes = 0;
+  for (const entry of batch.entries) {
+    const entryBytes = entry.encrypted.length + (entry.preview?.encrypted.length ?? 0);
+    if (selected.length > 0 && (
+      selected.length >= GITHUB_PHOTO_BATCH_MAX_COUNT
+      || encryptedBytes + entryBytes > GITHUB_PHOTO_BATCH_MAX_BYTES
+    )) {
+      break;
+    }
+    selected.push(entry);
+    encryptedBytes += entryBytes;
+  }
+  batch.entries.splice(0, selected.length);
+  batch.encryptedBytes = Math.max(0, batch.encryptedBytes - encryptedBytes);
+  return selected;
+}
+
+async function flushGithubPhotoBatch(batch: PendingGithubPhotoBatch): Promise<void> {
+  if (batch.flushing) return;
+  batch.flushing = true;
+  try {
+    while (batch.flushRequested && batch.entries.length > 0) {
+      batch.flushRequested = false;
+      const entries = takeGithubPhotoBatchEntries(batch);
+      if (entries.length === 0) break;
+      const hadRemainingEntries = batch.entries.length > 0;
+      try {
+        const uploaded = await uploadGithubPhotosBatch(
+          batch.credentials,
+          entries.map(({ image, encrypted, preview }) => ({ image, encrypted, ...(preview ? { preview } : {}) })),
+        );
+        if (uploaded.length !== entries.length) {
+          throw new Error("GitHub 批量上传返回的照片数量不匹配");
+        }
+        remoteImagesCache = null;
+        entries.forEach((entry, index) => entry.resolve(uploaded[index]));
+      } catch (error) {
+        entries.forEach((entry) => entry.reject(error));
+      }
+      if ((hadRemainingEntries && batch.entries.length > 0)
+        || batch.entries.length >= GITHUB_PHOTO_BATCH_MAX_COUNT
+        || batch.encryptedBytes >= GITHUB_PHOTO_BATCH_MAX_BYTES
+      ) {
+        batch.flushRequested = true;
+      }
+    }
+  } finally {
+    batch.flushing = false;
+    if (batch.entries.length === 0) {
+      if (batch.timer) clearTimeout(batch.timer);
+      batch.timer = null;
+      const key = githubPhotoBatchKey(batch.credentials);
+      if (pendingGithubPhotoBatches.get(key) === batch) pendingGithubPhotoBatches.delete(key);
+    } else if (batch.flushRequested) {
+      void flushGithubPhotoBatch(batch);
+    } else {
+      scheduleGithubPhotoBatchFlush(batch);
+    }
+  }
+}
+
+function queueGithubPhotoUpload(
+  credentials: GithubTransferCredentials,
+  entry: GithubPhotoUploadBatchEntry,
+): Promise<RemoteImage> {
+  const key = githubPhotoBatchKey(credentials);
+  let batch = pendingGithubPhotoBatches.get(key);
+  if (!batch) {
+    batch = {
+      credentials,
+      entries: [],
+      encryptedBytes: 0,
+      timer: null,
+      flushing: false,
+      flushRequested: false,
+    };
+    pendingGithubPhotoBatches.set(key, batch);
+  }
+
+  return new Promise<RemoteImage>((resolve, reject) => {
+    batch.entries.push({ ...entry, resolve, reject });
+    batch.encryptedBytes += entry.encrypted.length + (entry.preview?.encrypted.length ?? 0);
+    if (batch.entries.length >= GITHUB_PHOTO_BATCH_MAX_COUNT
+      || batch.encryptedBytes >= GITHUB_PHOTO_BATCH_MAX_BYTES
+    ) {
+      if (batch.timer) clearTimeout(batch.timer);
+      batch.timer = null;
+      batch.flushRequested = true;
+      void flushGithubPhotoBatch(batch);
+    } else {
+      scheduleGithubPhotoBatchFlush(batch);
+    }
+  });
+}
+
 async function uploadGithubSnapshotFile(
   credentials: GithubTransferCredentials,
   filePath: string,
@@ -1914,7 +2047,11 @@ async function uploadGithubSnapshotFile(
     storagePath: githubImagePath(credentials, imageId),
   };
   const preview = createGithubPreviewUpload(filePath, credentials, imageId);
-  const savedImage = await uploadGithubImage(credentials, image, encrypted, preview ?? undefined);
+  const savedImage = await queueGithubPhotoUpload(credentials, {
+    image,
+    encrypted,
+    ...(preview ? { preview } : {}),
+  });
   rememberUploadedFile(filePath, afterRead, plainSha256, savedImage);
   remoteImagesCache = null;
   removePendingUpload(filePath);
@@ -2056,22 +2193,28 @@ async function retryPendingUploads(): Promise<TransferRetryResult> {
     let sent = 0;
     let failed = 0;
     let lastError: string | undefined;
+    const readableQueue: PendingUpload[] = [];
     for (const item of queue) {
       try {
         await fs.promises.access(item.path, fs.constants.R_OK);
+        readableQueue.push(item);
       } catch (error) {
         markPendingUploadFailure(item.path, error);
         failed += 1;
         lastError = transferErrorMessage(error);
-        continue;
       }
-      try {
-        await uploadSnapshotFile(item.path);
-        sent += 1;
-      } catch (error) {
-        failed += 1;
-        lastError = transferErrorMessage(error);
-      }
+    }
+    for (let offset = 0; offset < readableQueue.length; offset += GITHUB_PHOTO_BATCH_MAX_COUNT) {
+      const group = readableQueue.slice(offset, offset + GITHUB_PHOTO_BATCH_MAX_COUNT);
+      await Promise.all(group.map(async (item) => {
+        try {
+          await uploadSnapshotFile(item.path);
+          sent += 1;
+        } catch (error) {
+          failed += 1;
+          lastError = transferErrorMessage(error);
+        }
+      }));
     }
     const backupResult = await retryPendingGithubBackups(true);
     const remainingUploads = readPendingUploads().length;
@@ -2148,16 +2291,19 @@ async function runSnapshotFolderSync(): Promise<void> {
   const directory = getSnapshotDirectory();
   await fs.promises.mkdir(directory, { recursive: true });
   const entries = await fs.promises.readdir(directory, { withFileTypes: true });
-  for (const entry of entries) {
-    if (!entry.isFile() || !isSupportedImageFile(entry.name)) {
-      continue;
+  const photoPaths = entries
+    .filter((entry) => entry.isFile() && isSupportedImageFile(entry.name))
+    .map((entry) => path.join(directory, entry.name));
+  for (let offset = 0; offset < photoPaths.length; offset += GITHUB_PHOTO_BATCH_MAX_COUNT) {
+    const group = photoPaths.slice(offset, offset + GITHUB_PHOTO_BATCH_MAX_COUNT);
+    await Promise.all(group.map(async (photoPath) => {
+      try {
+        await uploadSnapshotFile(photoPath);
+      } catch (error) {
+        console.warn("Unable to sync photo", path.basename(photoPath), error);
+      }
+    }));
     }
-    try {
-      await uploadSnapshotFile(path.join(directory, entry.name));
-    } catch (error) {
-      console.warn("Unable to sync photo", entry.name, error);
-    }
-  }
 }
 
 function syncSnapshotFolder(): void {

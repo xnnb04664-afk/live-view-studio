@@ -1586,10 +1586,6 @@ export default function App() {
       if (event.key === " " || event.key.toLowerCase() === "p") {
         event.preventDefault();
         void takeSnapshot();
-      } else if (event.key.toLowerCase() === "c") {
-        toggleCamera();
-      } else if (event.key.toLowerCase() === "m") {
-        toggleMicrophone();
       } else if (event.key.toLowerCase() === "f") {
         void toggleFullscreen();
       } else if (event.key.toLowerCase() === "r") {
@@ -1601,7 +1597,7 @@ export default function App() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [isFullscreen, isSettingsOpen, isTransferOpen, resetView, takeSnapshot, toggleCamera, toggleFullscreen, toggleMicrophone]);
+  }, [isFullscreen, isSettingsOpen, isTransferOpen, resetView, takeSnapshot, toggleFullscreen]);
 
   const videoStyle = {
     transform: `translate3d(${capture.panX}%, ${capture.panY}%, 0) scale(${capture.zoom}) scaleX(${capture.mirrored ? -1 : 1})`,
@@ -1837,7 +1833,7 @@ export default function App() {
                   <button className="dock-button-reset" type="button" onClick={resetDockButtons}>{t("恢复默认按钮")}</button>
                 </div>
 
-                <div className="shortcut-card settings-shortcuts"><div className="shortcut-title"><Icon name="settings" size={14} />{t("快捷操作")}</div><div className="shortcut-grid"><span><kbd>C</kbd>{t("镜头")}</span><span><kbd>M</kbd>{t("麦克风")}</span><span><kbd>F</kbd>{t("全屏")}</span><span><kbd>R</kbd>{t("复位")}</span><span><kbd>Space</kbd>{t("拍照")}</span><span><kbd>Esc</kbd>{t("关闭设置")}</span></div></div>
+                <div className="shortcut-card settings-shortcuts"><div className="shortcut-title"><Icon name="settings" size={14} />{t("快捷操作")}</div><div className="shortcut-grid"><span><kbd>F</kbd>{t("全屏")}</span><span><kbd>R</kbd>{t("复位")}</span><span><kbd>Space</kbd>{t("拍照")}</span><span><kbd>Esc</kbd>{t("关闭设置")}</span></div></div>
               </div>
             </div>
 

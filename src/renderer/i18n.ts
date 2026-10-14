@@ -215,7 +215,6 @@ const english: Record<string, string> = {
   "勾选要显示的按钮，也可以把隐藏的功能重新添加到控制栏。": "Choose which buttons to show. Hidden controls can be added back to the panel.",
   "恢复默认按钮": "Restore default buttons",
   "快捷操作": "Keyboard shortcuts",
-  "镜头": "Camera",
   "复位": "Reset",
   "拍照": "Take photo",
   "设置会自动保存": "Settings are saved automatically",
