@@ -597,6 +597,67 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px s
   .action-panel .quick-actions { grid-template-columns: minmax(170px, .8fr) minmax(230px, 1.4fr); }
 }
 
+/* Compact capture mode keeps the shutter and zoom in view while hiding auxiliary controls. */
+.control-panel.action-panel.is-compact:not(.is-collapsed) {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  flex-basis: var(--dock-height, clamp(175px, 22vh, 210px));
+  gap: 10px;
+  padding: 15px 24px 12px;
+}
+.action-panel.is-compact:not(.is-collapsed) .action-heading {
+  flex: 0 0 auto;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0;
+}
+.action-panel.is-compact:not(.is-collapsed) .action-heading-title { flex: 0 1 auto; gap: 12px; }
+.action-panel.is-compact:not(.is-collapsed) .action-heading h2 { font-size: 18px; }
+.action-panel.is-compact:not(.is-collapsed) .settings-trigger { align-self: center; }
+.action-panel.is-compact:not(.is-collapsed) .quick-actions {
+  display: grid;
+  grid-template-columns: minmax(230px, 36fr) minmax(0, 64fr);
+  align-items: center;
+  gap: clamp(14px, 2vw, 28px);
+  min-height: 0;
+  width: 100%;
+}
+.action-panel.is-compact .quick-zoom { display: flex; flex-direction: column; justify-content: center; gap: 12px; padding: 0; }
+.action-panel.is-compact .quick-label { margin-bottom: 0; }
+.action-panel.is-compact .zoom-hint,
+.action-panel.is-compact .pan-zone,
+.action-panel.is-compact .quick-status,
+.action-panel.is-compact .action-panel-footer,
+.action-panel.is-compact .shutter-button-large small { display: none; }
+.action-panel.is-compact .shutter-button-large { min-height: 96px; height: 100%; padding: 14px 22px; }
+
+.workspace.dock-left .control-panel.action-panel.is-compact:not(.is-collapsed),
+.workspace.dock-right .control-panel.action-panel.is-compact:not(.is-collapsed) {
+  display: flex;
+  flex-basis: var(--dock-width, clamp(260px, 28vw, 370px));
+  width: var(--dock-width, clamp(260px, 28vw, 370px));
+  height: auto;
+  flex-direction: column;
+  gap: 18px;
+  padding: 18px 20px;
+}
+.workspace.dock-left .action-panel.is-compact:not(.is-collapsed) .quick-actions,
+.workspace.dock-right .action-panel.is-compact:not(.is-collapsed) .quick-actions {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  justify-content: center;
+  gap: 18px;
+}
+
+@media (max-width: 780px) {
+  .control-panel.action-panel.is-compact:not(.is-collapsed) { padding: 14px 16px 12px; }
+  .action-panel.is-compact:not(.is-collapsed) .quick-actions { grid-template-columns: minmax(205px, 42fr) minmax(0, 58fr); gap: 12px; }
+  .action-panel.is-compact:not(.is-collapsed) .shutter-button-large { min-height: 82px; padding: 12px 15px; }
+}
+
 /* The optional free-pan mode makes the drag affordance honest at every zoom level. */
 .video-surface.has-video { cursor: default; }
 .video-surface.has-video.can-pan { cursor: grab; }

@@ -1,8 +1,9 @@
-import { app, BrowserWindow, dialog, ipcMain, nativeImage, safeStorage, session, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeImage, safeStorage, session, shell, type IpcMainEvent, type IpcMainInvokeEvent, type WebContents } from "electron";
 import { execFile } from "node:child_process";
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import {
@@ -53,7 +54,7 @@ const GITHUB_PHOTO_BATCH_MAX_BYTES = 12 * 1024 * 1024;
 const GITHUB_PHOTO_BATCH_WAIT_MS = 300;
 const DEFAULT_SNAPSHOT_DIRECTORY = "D:\\照片传送";
 const SUPPORTED_IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".heif"]);
-const SNAPSHOT_FILE_STAMP_PATTERN = /^取景-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$/u;
+const SNAPSHOT_FILE_STAMP_PATTERN = /^取景-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})(?:-(\d{3}))?(?:-\d+)?$/u;
 const IMAGE_MIME_TYPES: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -270,7 +271,7 @@ function getCaptureTimestamp(filePath: string, stat: fs.Stats): string {
   const baseName = path.basename(filePath, path.extname(filePath));
   const match = SNAPSHOT_FILE_STAMP_PATTERN.exec(baseName);
   if (match) {
-    const [, year, month, day, hour, minute, second] = match;
+    const [, year, month, day, hour, minute, second, milliseconds = "000"] = match;
     const localDate = new Date(
       Number(year),
       Number(month) - 1,
@@ -278,6 +279,7 @@ function getCaptureTimestamp(filePath: string, stat: fs.Stats): string {
       Number(hour),
       Number(minute),
       Number(second),
+      Number(milliseconds),
     );
     if (
       Number.isFinite(localDate.getTime())
@@ -287,6 +289,7 @@ function getCaptureTimestamp(filePath: string, stat: fs.Stats): string {
       && localDate.getHours() === Number(hour)
       && localDate.getMinutes() === Number(minute)
       && localDate.getSeconds() === Number(second)
+      && localDate.getMilliseconds() === Number(milliseconds)
     ) {
       return localDate.toISOString();
     }
@@ -401,21 +404,48 @@ async function getGithubToken(): Promise<string> {
 }
 
 function readTransferCredentials(): TransferCredentials | null {
+  let fileContents: string;
   try {
-    const envelope = JSON.parse(fs.readFileSync(getTransferCredentialsPath(), "utf8")) as {
-      mode?: "encrypted" | "plain";
-      value?: string;
-    };
-    if (!envelope.value) {
+    fileContents = fs.readFileSync(getTransferCredentialsPath(), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return null;
     }
-    const raw = envelope.mode === "encrypted" && safeStorage.isEncryptionAvailable()
-      ? safeStorage.decryptString(Buffer.from(envelope.value, "base64"))
-      : envelope.value;
-    return JSON.parse(raw) as TransferCredentials;
-  } catch {
-    return null;
+    throw error;
   }
+
+  const envelope = JSON.parse(fileContents) as {
+    mode?: "encrypted" | "plain";
+    value?: unknown;
+  };
+  if (!envelope || typeof envelope !== "object" || typeof envelope.value !== "string" || !envelope.value) {
+    throw new Error("照片通道凭据文件格式无效，已停止初始化以保护现有配对");
+  }
+
+  let raw: string;
+  if (envelope.mode === "encrypted") {
+    if (!safeStorage.isEncryptionAvailable()) {
+      throw new Error("系统加密存储暂不可用，无法读取现有照片通道凭据；请稍后重试");
+    }
+    raw = safeStorage.decryptString(Buffer.from(envelope.value, "base64"));
+  } else {
+    if (envelope.mode !== undefined && envelope.mode !== "plain") {
+      throw new Error("照片通道凭据加密方式未知，已停止初始化以保护现有配对");
+    }
+    raw = envelope.value;
+  }
+
+  const credentials = JSON.parse(raw) as TransferCredentials;
+  if (!credentials || typeof credentials !== "object") {
+    throw new Error("照片通道凭据内容无效，已停止初始化以保护现有配对");
+  }
+  if (envelope.mode !== "encrypted" && safeStorage.isEncryptionAvailable()) {
+    writeJsonAtomically(getTransferCredentialsPath(), {
+      mode: "encrypted",
+      value: safeStorage.encryptString(raw).toString("base64"),
+    });
+  }
+  return credentials;
 }
 
 function readGithubCredentialsBackup(): GithubTransferCredentials | null {
@@ -431,7 +461,16 @@ function readGithubCredentialsBackup(): GithubTransferCredentials | null {
       ? safeStorage.decryptString(Buffer.from(envelope.value, "base64"))
       : envelope.value;
     const credentials = JSON.parse(raw) as TransferCredentials;
-    return isGithubCredentials(credentials) ? credentials : null;
+    if (!isGithubCredentials(credentials)) {
+      return null;
+    }
+    if (envelope.mode !== "encrypted" && safeStorage.isEncryptionAvailable()) {
+      writeJsonAtomically(getGithubCredentialsBackupPath(), {
+        mode: "encrypted",
+        value: safeStorage.encryptString(raw).toString("base64"),
+      });
+    }
+    return credentials;
   } catch {
     return null;
   }
@@ -478,21 +517,23 @@ async function writeBufferAtomically(filePath: string, bytes: Buffer): Promise<v
 }
 
 function writeTransferCredentials(credentials: TransferCredentials): void {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error("系统加密存储暂不可用，未保存照片通道凭据。请稍后重试。");
+  }
   fs.mkdirSync(path.dirname(getTransferCredentialsPath()), { recursive: true });
   const raw = JSON.stringify(credentials);
-  const envelope = safeStorage.isEncryptionAvailable()
-    ? { mode: "encrypted" as const, value: safeStorage.encryptString(raw).toString("base64") }
-    : { mode: "plain" as const, value: raw };
+  const envelope = { mode: "encrypted" as const, value: safeStorage.encryptString(raw).toString("base64") };
   writeJsonAtomically(getTransferCredentialsPath(), envelope);
 }
 
 function writeGithubCredentialsBackup(credentials: GithubTransferCredentials): void {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error("系统加密存储暂不可用，未保存 GitHub 备用凭据。请稍后重试。");
+  }
   const backupPath = getGithubCredentialsBackupPath();
   fs.mkdirSync(path.dirname(backupPath), { recursive: true });
   const raw = JSON.stringify(credentials);
-  const envelope = safeStorage.isEncryptionAvailable()
-    ? { mode: "encrypted" as const, value: safeStorage.encryptString(raw).toString("base64") }
-    : { mode: "plain" as const, value: raw };
+  const envelope = { mode: "encrypted" as const, value: safeStorage.encryptString(raw).toString("base64") };
   writeJsonAtomically(backupPath, envelope);
 }
 
@@ -1285,6 +1326,14 @@ function isRetryableLocalUploadError(error: unknown): boolean {
   return code === "EBUSY" || code === "EAGAIN" || code === "EINTR" || code === "EPERM" || code === "EACCES";
 }
 
+function isPermanentlyMissingLocalUploadFile(error: unknown): boolean {
+  if (!error || typeof error !== "object" || !("code" in error)) {
+    return false;
+  }
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
 function enqueuePendingUploadPlaceholder(filePath: string): void {
   const normalizedPath = normalizeFilePath(filePath);
   const queue = readPendingUploads();
@@ -1745,11 +1794,37 @@ async function repairGithubMissingImages(credentials: GithubTransferCredentials)
     expiresAt: Date.now() + 15_000,
     images: remoteImages,
   };
-  const remoteIds = new Set(remoteImages.map((image) => image.id));
+  const remoteImagesById = new Map(remoteImages.map((image) => [image.id, image]));
   const uploadedFiles = readUploadedFileManifest();
+  const uploadedRecords = Object.values(uploadedFiles);
+  if (!uploadedRecords.some((record) => Boolean(record.image?.id))) {
+    return;
+  }
+  let remoteFilePaths: Set<string> | null = null;
+  const hasLocalCopiesOfRemoteImages = uploadedRecords.some((record) => (
+    Boolean(record.image?.id && remoteImagesById.has(record.image.id))
+  ));
+  if (hasLocalCopiesOfRemoteImages) {
+    try {
+      // Use one committed tree snapshot for the whole channel instead of probing
+      // GitHub once per photo. A truncated or failed tree is unknown, not proof
+      // that each original blob is missing.
+      remoteFilePaths = await listGithubFilePaths(credentials);
+    } catch (error) {
+      console.warn("Unable to verify GitHub photo blobs; only missing manifest entries will be repaired", error);
+    }
+  }
 
-  for (const record of Object.values(uploadedFiles)) {
-    if (!record.image?.id || remoteIds.has(record.image.id)) {
+  for (const record of uploadedRecords) {
+    if (!record.image?.id) {
+      continue;
+    }
+    const existingRemoteImage = remoteImagesById.get(record.image.id);
+    const existingImagePath = existingRemoteImage?.storagePath || githubImagePath(credentials, record.image.id);
+    const restoreImageBlob = Boolean(existingRemoteImage
+      && remoteFilePaths
+      && !remoteFilePaths.has(existingImagePath));
+    if (existingRemoteImage && !restoreImageBlob) {
       continue;
     }
 
@@ -1782,8 +1857,15 @@ async function repairGithubMissingImages(credentials: GithubTransferCredentials)
         record.image.mimeType,
         plainSha256,
         repairedPending,
+        restoreImageBlob,
       );
-      remoteIds.add(restored.id);
+      remoteImagesById.set(restored.id, restored);
+      remoteFilePaths?.add(restored.storagePath || githubImagePath(credentials, restored.id));
+      remoteImagesCache = {
+        channelId: credentials.channelId,
+        expiresAt: Date.now() + 15_000,
+        images: [...remoteImagesById.values()],
+      };
     } catch (error) {
       console.warn("Unable to restore missing GitHub photo", record.path, error);
     }
@@ -1997,12 +2079,13 @@ async function uploadGithubSnapshotFile(
   mimeType: string,
   plainSha256: string,
   pending: PendingUpload,
+  restoreImageBlob = false,
 ): Promise<RemoteImage> {
   try {
     const existingRemoteImage = (await listGithubImagesCached(credentials)).find((image) => (
       image.sha256 === plainSha256 && image.plainSize === plain.length
     ));
-    if (existingRemoteImage) {
+    if (existingRemoteImage && !restoreImageBlob) {
       try {
         const preview = createGithubPreviewUpload(filePath, credentials, existingRemoteImage.id);
         const upgradedImage = await uploadGithubImage(credentials, existingRemoteImage, Buffer.alloc(0), preview ?? undefined);
@@ -2047,11 +2130,13 @@ async function uploadGithubSnapshotFile(
     storagePath: githubImagePath(credentials, imageId),
   };
   const preview = createGithubPreviewUpload(filePath, credentials, imageId);
-  const savedImage = await queueGithubPhotoUpload(credentials, {
-    image,
-    encrypted,
-    ...(preview ? { preview } : {}),
-  });
+  const savedImage = restoreImageBlob
+    ? await uploadGithubImage(credentials, image, encrypted, preview ?? undefined, { restoreImageBlob: true })
+    : await queueGithubPhotoUpload(credentials, {
+      image,
+      encrypted,
+      ...(preview ? { preview } : {}),
+    });
   rememberUploadedFile(filePath, afterRead, plainSha256, savedImage);
   remoteImagesCache = null;
   removePendingUpload(filePath);
@@ -2162,6 +2247,10 @@ async function uploadSnapshotFile(filePath: string): Promise<RemoteImage> {
   const resolvedPath = path.resolve(filePath);
   const trackedUpload = uploadSnapshotFileInternal(resolvedPath)
     .catch((error) => {
+      if (isPermanentlyMissingLocalUploadFile(error)) {
+        removePendingUpload(resolvedPath);
+        throw new Error("本地照片文件已不存在，已从待传队列移除");
+      }
       let queued = markPendingUploadFailure(resolvedPath, error);
       if (!queued && isRetryableLocalUploadError(error)) {
         enqueuePendingUploadPlaceholder(resolvedPath);
@@ -2199,9 +2288,14 @@ async function retryPendingUploads(): Promise<TransferRetryResult> {
         await fs.promises.access(item.path, fs.constants.R_OK);
         readableQueue.push(item);
       } catch (error) {
-        markPendingUploadFailure(item.path, error);
+        if (isPermanentlyMissingLocalUploadFile(error)) {
+          removePendingUpload(item.path);
+          lastError = "本地照片文件已不存在，已从待传队列移除";
+        } else {
+          markPendingUploadFailure(item.path, error);
+          lastError = transferErrorMessage(error);
+        }
         failed += 1;
-        lastError = transferErrorMessage(error);
       }
     }
     for (let offset = 0; offset < readableQueue.length; offset += GITHUB_PHOTO_BATCH_MAX_COUNT) {
@@ -2476,6 +2570,77 @@ function ensureMainWindow(): BrowserWindow {
   return mainWindow;
 }
 
+function isTrustedRendererUrl(urlValue: string): boolean {
+  try {
+    const actual = new URL(urlValue);
+    if (DEV_SERVER_URL) {
+      return actual.origin === new URL(DEV_SERVER_URL).origin;
+    }
+    const expected = pathToFileURL(path.resolve(__dirname, "../dist/index.html"));
+    return actual.protocol === "file:" && actual.pathname === expected.pathname;
+  } catch {
+    return false;
+  }
+}
+
+function isTrustedMediaOrigin(webContents: WebContents | null, requestingOrigin: string): boolean {
+  if (
+    !webContents
+    || !mainWindow
+    || mainWindow.isDestroyed()
+    || webContents !== mainWindow.webContents
+    || !isTrustedRendererUrl(webContents.getURL())
+  ) {
+    return false;
+  }
+  if (webContents.getURL().startsWith("file:")) {
+    return requestingOrigin.startsWith("file:");
+  }
+  try {
+    return new URL(requestingOrigin).origin === new URL(webContents.getURL()).origin;
+  } catch {
+    return false;
+  }
+}
+
+function isTrustedIpcSender(
+  sender: WebContents,
+  senderUrl?: string,
+): boolean {
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents !== sender || !senderUrl) {
+    return false;
+  }
+  return isTrustedRendererUrl(senderUrl);
+}
+
+function assertTrustedIpcSender(sender: WebContents, senderUrl?: string): void {
+  if (!isTrustedIpcSender(sender, senderUrl)) {
+    throw new Error("已拒绝来自非应用页面的 IPC 请求");
+  }
+}
+
+function registerIpcHandler<TArgs extends unknown[], TResult>(
+  channel: string,
+  handler: (event: IpcMainInvokeEvent, ...args: TArgs) => TResult,
+): void {
+  ipcMain.handle(channel, (event, ...args) => {
+    assertTrustedIpcSender(event.sender, event.senderFrame?.url);
+    return handler(event, ...(args as TArgs));
+  });
+}
+
+function registerIpcListener<TArgs extends unknown[]>(
+  channel: string,
+  handler: (event: IpcMainEvent, ...args: TArgs) => void,
+): void {
+  ipcMain.on(channel, (event, ...args) => {
+    if (!isTrustedIpcSender(event.sender, event.senderFrame?.url)) {
+      return;
+    }
+    handler(event, ...(args as TArgs));
+  });
+}
+
 function getSnapshotDirectory(): string {
   if (!snapshotDirectoryOverrideLoaded) {
     try {
@@ -2492,6 +2657,33 @@ function getSnapshotDirectory(): string {
     return snapshotDirectoryOverride;
   }
   return process.env.SNAPSHOT_DIRECTORY?.trim() || DEFAULT_SNAPSHOT_DIRECTORY;
+}
+
+function isPathWithinDirectory(root: string, candidate: string): boolean {
+  const relativePath = path.relative(root, candidate);
+  return Boolean(relativePath)
+    && relativePath !== ".."
+    && !relativePath.startsWith(`..${path.sep}`)
+    && !path.isAbsolute(relativePath);
+}
+
+async function resolveSnapshotUploadPath(filePath: string): Promise<string> {
+  const configuredRoot = path.resolve(getSnapshotDirectory());
+  const candidatePath = path.resolve(filePath);
+  if (!isPathWithinDirectory(configuredRoot, candidatePath)) {
+    throw new Error("只能上传当前照片目录中的照片");
+  }
+
+  const rootRealPath = await fs.promises.realpath(configuredRoot);
+  const targetRealPath = await fs.promises.realpath(candidatePath);
+  if (!isPathWithinDirectory(rootRealPath, targetRealPath)) {
+    throw new Error("照片路径通过符号链接指向照片目录之外，已拒绝上传");
+  }
+  const stat = await fs.promises.stat(targetRealPath);
+  if (!stat.isFile()) {
+    throw new Error("照片路径不是文件");
+  }
+  return targetRealPath;
 }
 
 function getSnapshotDirectorySettingsPath(): string {
@@ -2517,15 +2709,15 @@ function persistSnapshotDirectory(directory: string | null): void {
 }
 
 function registerIpcHandlers(): void {
-  ipcMain.on("window:minimize", () => {
+  registerIpcListener("window:minimize", () => {
     ensureMainWindow().minimize();
   });
 
-  ipcMain.on("window:close", () => {
+  registerIpcListener("window:close", () => {
     ensureMainWindow().close();
   });
 
-  ipcMain.handle("window:toggle-maximize", () => {
+  registerIpcHandler("window:toggle-maximize", () => {
     const window = ensureMainWindow();
     if (window.isMaximized()) {
       window.unmaximize();
@@ -2535,19 +2727,19 @@ function registerIpcHandlers(): void {
     return window.isMaximized();
   });
 
-  ipcMain.handle("window:set-fullscreen", (_event, enabled: boolean) => {
+  registerIpcHandler("window:set-fullscreen", (_event, enabled: boolean) => {
     const window = ensureMainWindow();
     window.setFullScreen(Boolean(enabled));
     return window.isFullScreen();
   });
 
-  ipcMain.handle("window:set-always-on-top", (_event, enabled: boolean) => {
+  registerIpcHandler("window:set-always-on-top", (_event, enabled: boolean) => {
     const window = ensureMainWindow();
     window.setAlwaysOnTop(Boolean(enabled), "floating");
     return window.isAlwaysOnTop();
   });
 
-  ipcMain.handle("window:get-state", () => {
+  registerIpcHandler("window:get-state", () => {
     const window = ensureMainWindow();
     return {
       isFullscreen: window.isFullScreen(),
@@ -2556,7 +2748,7 @@ function registerIpcHandlers(): void {
     };
   });
 
-  ipcMain.handle("snapshot:save", async (_event, dataUrl: string): Promise<SnapshotResult> => {
+  registerIpcHandler("snapshot:save", async (_event, dataUrl: string): Promise<SnapshotResult> => {
     if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:image/png;base64,")) {
       throw new Error("照片数据格式不受支持");
     }
@@ -2569,17 +2761,31 @@ function registerIpcHandlers(): void {
     await fs.promises.mkdir(directory, { recursive: true });
     const stamp = new Date();
     const pad = (value: number) => String(value).padStart(2, "0");
-    const fileName = `取景-${stamp.getFullYear()}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}-${pad(stamp.getHours())}${pad(stamp.getMinutes())}${pad(stamp.getSeconds())}.png`;
-    const filePath = path.join(directory, fileName);
+    const stampName = `取景-${stamp.getFullYear()}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}-${pad(stamp.getHours())}${pad(stamp.getMinutes())}${pad(stamp.getSeconds())}-${String(stamp.getMilliseconds()).padStart(3, "0")}`;
     const base64 = dataUrl.replace(/^data:image\/png;base64,/, "");
-    await fs.promises.writeFile(filePath, Buffer.from(base64, "base64"));
+    const bytes = Buffer.from(base64, "base64");
+    let collisionSuffix = 0;
+    let filePath: string;
+    while (true) {
+      const suffix = collisionSuffix === 0 ? "" : `-${collisionSuffix}`;
+      filePath = path.join(directory, `${stampName}${suffix}.png`);
+      try {
+        await fs.promises.writeFile(filePath, bytes, { flag: "wx" });
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+          throw error;
+        }
+        collisionSuffix += 1;
+      }
+    }
 
     return { path: filePath, directory };
   });
 
-  ipcMain.handle("snapshot:get-directory", () => getSnapshotDirectory());
+  registerIpcHandler("snapshot:get-directory", () => getSnapshotDirectory());
 
-  ipcMain.handle("snapshot:choose-directory", async (): Promise<string | null> => {
+  registerIpcHandler("snapshot:choose-directory", async (): Promise<string | null> => {
     const result = await dialog.showOpenDialog(ensureMainWindow(), {
       defaultPath: getSnapshotDirectory(),
       properties: ["openDirectory", "createDirectory"],
@@ -2600,7 +2806,7 @@ function registerIpcHandlers(): void {
     return directory;
   });
 
-  ipcMain.handle("snapshot:reset-directory", async (): Promise<string> => {
+  registerIpcHandler("snapshot:reset-directory", async (): Promise<string> => {
     persistSnapshotDirectory(null);
     stopSnapshotFolderSync();
     void startSnapshotFolderSync().catch((error) => {
@@ -2609,24 +2815,24 @@ function registerIpcHandlers(): void {
     return getSnapshotDirectory();
   });
 
-  ipcMain.handle("snapshot:open-folder", async () => {
+  registerIpcHandler("snapshot:open-folder", async () => {
     const directory = getSnapshotDirectory();
     await fs.promises.mkdir(directory, { recursive: true });
     await shell.openPath(directory);
   });
 
-  ipcMain.handle("transfer:get-state", () => getTransferState());
-  ipcMain.handle("transfer:ensure-channel", () => ensureTransferChannel());
-  ipcMain.handle("transfer:reset-pairing", () => resetTransferPairing());
-  ipcMain.handle("transfer:upload-snapshot", (_event, filePath: string) => {
+  registerIpcHandler("transfer:get-state", () => getTransferState());
+  registerIpcHandler("transfer:ensure-channel", () => ensureTransferChannel());
+  registerIpcHandler("transfer:reset-pairing", () => resetTransferPairing());
+  registerIpcHandler("transfer:upload-snapshot", async (_event, filePath: string) => {
     if (typeof filePath !== "string" || !filePath) {
       throw new Error("照片路径无效");
     }
-    return uploadSnapshotFile(filePath);
+    return uploadSnapshotFile(await resolveSnapshotUploadPath(filePath));
   });
-  ipcMain.handle("transfer:retry-pending", () => retryPendingUploads());
+  registerIpcHandler("transfer:retry-pending", () => retryPendingUploads());
 
-  ipcMain.handle("system:open-privacy-settings", async (_event, target: PrivacyTarget) => {
+  registerIpcHandler("system:open-privacy-settings", async (_event, target: PrivacyTarget) => {
     const settingsUri = target === "microphone" ? "ms-settings:privacy-microphone" : "ms-settings:privacy-webcam";
     await shell.openExternal(settingsUri);
   });
@@ -2637,9 +2843,18 @@ app.whenReady().then(() => {
     return;
   }
 
-  session.defaultSession.setPermissionCheckHandler((_webContents, permission) => permission === "media");
-  session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
-    callback(permission === "media");
+  session.defaultSession.setPermissionCheckHandler((webContents, permission, requestingOrigin) => {
+    return permission === "media" && isTrustedMediaOrigin(webContents, requestingOrigin);
+  });
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    const requestingUrl = "requestingUrl" in details ? details.requestingUrl : "";
+    const isMainFrame = "isMainFrame" in details && details.isMainFrame;
+    callback(
+      permission === "media"
+      && Boolean(mainWindow && webContents === mainWindow.webContents)
+      && isMainFrame
+      && isTrustedRendererUrl(requestingUrl),
+    );
   });
   registerIpcHandlers();
   createMainWindow();

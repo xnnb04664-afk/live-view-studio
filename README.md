@@ -1,6 +1,6 @@
 # 取景台 · Live View Studio
 
-[中文](#中文) · [English](#english) · [Project website](https://xnnb04664-afk.github.io/live-view-studio/) · [下载 Windows 安装包](https://github.com/xnnb04664-afk/live-view-studio/releases/download/v0.1.4/LiveViewStudio-Setup-0.1.4.exe) · [Download installer](https://github.com/xnnb04664-afk/live-view-studio/releases/download/v0.1.4/LiveViewStudio-Setup-0.1.4.exe)
+[中文](#中文) · [English](#english) · [Project website](https://xnnb04664-afk.github.io/live-view-studio/) · [下载 Windows 安装包（0.1.5）](https://github.com/xnnb04664-afk/live-view-studio/releases/download/v0.1.5/LiveViewStudio-Setup-0.1.5.exe) · [Download installer (0.1.5)](https://github.com/xnnb04664-afk/live-view-studio/releases/download/v0.1.5/LiveViewStudio-Setup-0.1.5.exe)
 
 Windows 摄像头取景与拍照桌面应用。实时预览、镜像、缩放和平移都在本机完成；可选手机收图通道会在上传前使用 AES-256-GCM 加密照片。
 

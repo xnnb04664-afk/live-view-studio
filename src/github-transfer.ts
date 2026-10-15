@@ -1,4 +1,5 @@
 import type { RemoteImage } from "./types";
+import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 
 const GITHUB_API_BASE_URL = "https://api.github.com";
 const GITHUB_API_VERSION = "2022-11-28";
@@ -9,6 +10,7 @@ const GITHUB_WRITE_TIMEOUT_MS = 60_000;
 const GITHUB_MAX_RETRY_DELAY_MS = 15_000;
 const GITHUB_MANIFEST_CONFLICT_ATTEMPTS = 5;
 const GITHUB_BATCH_BLOB_CONCURRENCY = 2;
+const GITHUB_TRANSFER_PROTOCOL_VERSION = "1";
 
 class GithubApiError extends Error {
   constructor(
@@ -348,6 +350,61 @@ export function githubImagePath(credentials: GithubTransferCredentials, imageId:
 
 export function githubPreviewPath(credentials: GithubTransferCredentials, imageId: string): string {
   return `channels/${credentials.channelId}/previews/${imageId}.jpg.bin`;
+}
+
+function decodeBase64Url(value: string): Buffer {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  return Buffer.from(normalized + "=".repeat((4 - (normalized.length % 4)) % 4), "base64");
+}
+
+function encodeBase64Url(value: Buffer): string {
+  return value.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function retargetGithubPreview(
+  credentials: GithubTransferCredentials,
+  sourceImageId: string,
+  targetImageId: string,
+  preview: GithubPreviewUpload,
+): GithubPreviewUpload {
+  if (sourceImageId === targetImageId) {
+    return { ...preview, storagePath: githubPreviewPath(credentials, targetImageId) };
+  }
+
+  const key = decodeBase64Url(credentials.roomKey);
+  const sourceNonce = decodeBase64Url(preview.nonce);
+  if (key.length !== 32 || sourceNonce.length !== 12 || preview.encrypted.length < 16) {
+    throw new Error("GitHub 照片预览密文格式无效，无法关联到已有照片");
+  }
+
+  const sourceAad = Buffer.from(
+    `${credentials.channelId}:${sourceImageId}:${GITHUB_TRANSFER_PROTOCOL_VERSION}:preview`,
+    "utf8",
+  );
+  const decipher = createDecipheriv("aes-256-gcm", key, sourceNonce);
+  decipher.setAAD(sourceAad);
+  decipher.setAuthTag(preview.encrypted.subarray(-16));
+  const plain = Buffer.concat([
+    decipher.update(preview.encrypted.subarray(0, -16)),
+    decipher.final(),
+  ]);
+
+  const targetNonce = randomBytes(12);
+  const targetAad = Buffer.from(
+    `${credentials.channelId}:${targetImageId}:${GITHUB_TRANSFER_PROTOCOL_VERSION}:preview`,
+    "utf8",
+  );
+  const cipher = createCipheriv("aes-256-gcm", key, targetNonce);
+  cipher.setAAD(targetAad);
+  const encrypted = Buffer.concat([cipher.update(plain), cipher.final(), cipher.getAuthTag()]);
+  return {
+    ...preview,
+    encrypted,
+    nonce: encodeBase64Url(targetNonce),
+    sizeBytes: encrypted.length,
+    plainSize: plain.length,
+    storagePath: githubPreviewPath(credentials, targetImageId),
+  };
 }
 
 function emptyManifest(credentials: GithubTransferCredentials): GithubManifest {
@@ -805,6 +862,10 @@ export async function uploadGithubPhotosBatch(
   }
   return await withGithubWriteLock(credentials, async () => {
     const blobShas = new Map<string, string>();
+    // Retargeting a preview generates a new nonce. Keep the first encrypted
+    // preview for each destination path so conflict retries reuse the exact
+    // bytes whose blob SHA is cached below.
+    const retargetedPreviewsByPath = new Map<string, GithubPreviewUpload>();
     let lastConflict: unknown;
 
     for (let attempt = 0; attempt < GITHUB_MANIFEST_CONFLICT_ATTEMPTS; attempt += 1) {
@@ -845,14 +906,19 @@ export async function uploadGithubPhotosBatch(
         if (!byId && sameContent) {
           resultIdByInputId.set(image.id, sameContent.id);
           if (preview && !sameContent.previewNonce) {
-            const previewStoragePath = githubPreviewPath(credentials, sameContent.id);
-            const previewForExisting = { ...preview, storagePath: previewStoragePath };
+            const previewPath = githubPreviewPath(credentials, sameContent.id);
+            let previewForExisting = retargetedPreviewsByPath.get(previewPath);
+            if (!previewForExisting) {
+              previewForExisting = retargetGithubPreview(credentials, image.id, sameContent.id, preview);
+              retargetedPreviewsByPath.set(previewPath, previewForExisting);
+            }
+            const previewStoragePath = previewForExisting.storagePath;
             const nextImage: RemoteImage = {
               ...sameContent,
-              previewSizeBytes: preview.sizeBytes,
-              previewMimeType: preview.mimeType,
-              previewNonce: preview.nonce,
-              previewPlainSize: preview.plainSize,
+              previewSizeBytes: previewForExisting.sizeBytes,
+              previewMimeType: previewForExisting.mimeType,
+              previewNonce: previewForExisting.nonce,
+              previewPlainSize: previewForExisting.plainSize,
               previewStoragePath,
             };
             const existingIndex = nextImages.findIndex((candidate) => candidate.id === sameContent.id);

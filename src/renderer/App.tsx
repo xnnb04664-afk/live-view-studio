@@ -63,6 +63,10 @@ const CAPTURE_HEALTH_CHECK_INTERVAL_MS = 2_000;
 const CAPTURE_UNHEALTHY_GRACE_MS = 4_000;
 const CAPTURE_RETRY_INITIAL_DELAY_MS = 2_000;
 const CAPTURE_RETRY_MAX_DELAY_MS = 30_000;
+const MICROPHONE_RETRY_INITIAL_DELAY_MS = 1_000;
+const MICROPHONE_RETRY_MAX_DELAY_MS = 30_000;
+const MICROPHONE_RETRY_MAX_ATTEMPTS = 6;
+const MICROPHONE_MUTED_RECOVERY_DELAY_MS = 3_000;
 
 type DockPosition = "bottom" | "top" | "left" | "right";
 type DockButtonId = "reset" | "fullscreen" | "alwaysOnTop" | "refresh" | "camera" | "microphone" | "mirror" | "folder";
@@ -140,6 +144,7 @@ function readStoredCaptureState(): CaptureState {
 type ControlDockSettings = {
   height: number | null;
   collapsed: boolean;
+  compactMode: boolean;
   position: DockPosition;
   buttons: DockButtonId[];
   buttonScales: Record<ButtonSizeId, number>;
@@ -148,7 +153,7 @@ type ControlDockSettings = {
 function readControlDockSettings(): ControlDockSettings {
   try {
     const stored = JSON.parse(localStorage.getItem(CONTROL_DOCK_STORAGE_KEY) ?? "null") as Partial<ControlDockSettings> | null;
-    const rawHeight = Number(stored?.height);
+    const rawHeight = stored?.height == null ? Number.NaN : Number(stored.height);
     const legacyButtonScale = Number((stored as Partial<ControlDockSettings> & { buttonScale?: number } | null)?.buttonScale);
     const storedPosition = stored?.position;
     const storedButtons = Array.isArray(stored?.buttons)
@@ -164,6 +169,7 @@ function readControlDockSettings(): ControlDockSettings {
     return {
       height: Number.isFinite(rawHeight) ? clamp(rawHeight, MIN_DOCK_HEIGHT, MAX_DOCK_HEIGHT) : null,
       collapsed: stored?.collapsed === true,
+      compactMode: stored?.compactMode === true,
       position: storedPosition === "top" || storedPosition === "left" || storedPosition === "right" ? storedPosition : "bottom",
       buttons: storedButtons,
       buttonScales,
@@ -172,6 +178,7 @@ function readControlDockSettings(): ControlDockSettings {
     return {
       height: null,
       collapsed: false,
+      compactMode: false,
       position: "bottom",
       buttons: DEFAULT_DOCK_BUTTONS,
       buttonScales: BUTTON_SIZE_OPTIONS.reduce((scales, option) => ({ ...scales, [option.id]: DEFAULT_DOCK_BUTTON_SCALE }), {} as Record<ButtonSizeId, number>),
@@ -574,6 +581,13 @@ export default function App() {
   const captureRequestIdRef = useRef(0);
   const captureRestartingRef = useRef(false);
   const captureRecoveryTimerRef = useRef<number | null>(null);
+  const microphoneRecoveryTimerRef = useRef<number | null>(null);
+  const microphoneRecoveryRequestIdRef = useRef(0);
+  const microphoneRecoveryInFlightRef = useRef(false);
+  const microphoneRecoveryAttemptsRef = useRef(0);
+  const microphoneRecoveryBlockedRef = useRef(false);
+  const scheduleMicrophoneRecoveryRef = useRef<(minimumDelayMs?: number) => void>(() => undefined);
+  const recoverMicrophoneRef = useRef<() => Promise<void>>(() => Promise.resolve());
   const captureRetryAttemptsRef = useRef(0);
   const scheduleCaptureRecoveryRef = useRef<(delay?: number) => void>(() => undefined);
   const captureUnhealthySinceRef = useRef<number | null>(null);
@@ -768,6 +782,15 @@ export default function App() {
     }
   }, []);
 
+  const clearMicrophoneRecoveryTimer = useCallback(() => {
+    if (microphoneRecoveryTimerRef.current !== null) {
+      window.clearTimeout(microphoneRecoveryTimerRef.current);
+      microphoneRecoveryTimerRef.current = null;
+    }
+    microphoneRecoveryRequestIdRef.current += 1;
+    microphoneRecoveryInFlightRef.current = false;
+  }, []);
+
   const refreshDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) {
       return;
@@ -784,9 +807,7 @@ export default function App() {
     setDevices(nextDevices);
 
     const current = captureRef.current;
-    const nextCameraId = current.cameraId && nextDevices.some((device) => device.kind === "videoinput" && device.deviceId === current.cameraId)
-      ? current.cameraId
-      : nextDevices.find((device) => device.kind === "videoinput")?.deviceId ?? null;
+    const nextCameraId = current.cameraId ?? nextDevices.find((device) => device.kind === "videoinput")?.deviceId ?? null;
     const nextMicrophoneId = current.microphoneId && nextDevices.some((device) => device.kind === "audioinput" && device.deviceId === current.microphoneId)
       ? current.microphoneId
       : nextDevices.find((device) => device.kind === "audioinput")?.deviceId ?? null;
@@ -795,6 +816,114 @@ export default function App() {
       updateCapture({ cameraId: nextCameraId, microphoneId: nextMicrophoneId });
     }
   }, [updateCapture]);
+
+  const scheduleMicrophoneRecovery = useCallback((minimumDelayMs = 0) => {
+    if (
+      !captureMountedRef.current
+      || !captureRef.current.microphoneEnabled
+      || microphoneRecoveryBlockedRef.current
+      || microphoneRecoveryInFlightRef.current
+      || microphoneRecoveryTimerRef.current !== null
+      || microphoneRecoveryAttemptsRef.current >= MICROPHONE_RETRY_MAX_ATTEMPTS
+    ) {
+      return;
+    }
+
+    const delay = Math.max(
+      minimumDelayMs,
+      Math.min(
+        MICROPHONE_RETRY_INITIAL_DELAY_MS * 2 ** microphoneRecoveryAttemptsRef.current,
+        MICROPHONE_RETRY_MAX_DELAY_MS,
+      ),
+    );
+    microphoneRecoveryAttemptsRef.current += 1;
+    microphoneRecoveryTimerRef.current = window.setTimeout(() => {
+      microphoneRecoveryTimerRef.current = null;
+      void recoverMicrophoneRef.current();
+    }, delay);
+  }, []);
+  scheduleMicrophoneRecoveryRef.current = scheduleMicrophoneRecovery;
+
+  const recoverMicrophoneTrack = useCallback(async () => {
+    const state = captureRef.current;
+    const activeStream = streamRef.current;
+    if (
+      !captureMountedRef.current
+      || !state.microphoneEnabled
+      || microphoneRecoveryBlockedRef.current
+      || !activeStream
+      || activeStream.getAudioTracks().some((track) => track.readyState === "live" && !track.muted)
+    ) {
+      return;
+    }
+
+    const microphoneId = state.microphoneId;
+    const captureRequestId = captureRequestIdRef.current;
+    const recoveryRequestId = ++microphoneRecoveryRequestIdRef.current;
+    microphoneRecoveryInFlightRef.current = true;
+
+    try {
+      const requested = await navigator.mediaDevices.getUserMedia({
+        video: false,
+        audio: microphoneId ? { deviceId: { exact: microphoneId } } : true,
+      });
+      const track = requested.getAudioTracks()[0] ?? null;
+      if (!track || track.readyState !== "live") {
+        requested.getTracks().forEach((requestedTrack) => requestedTrack.stop());
+        throw new DOMException("No live microphone track was returned", "NotFoundError");
+      }
+
+      if (
+        recoveryRequestId !== microphoneRecoveryRequestIdRef.current
+        || captureRequestId !== captureRequestIdRef.current
+        || streamRef.current !== activeStream
+        || !captureMountedRef.current
+        || !captureRef.current.microphoneEnabled
+        || captureRef.current.microphoneId !== microphoneId
+      ) {
+        track.stop();
+        return;
+      }
+
+      activeStream.getAudioTracks().forEach((previousTrack) => {
+        activeStream.removeTrack(previousTrack);
+        if (previousTrack.readyState === "live") {
+          previousTrack.stop();
+        }
+      });
+      activeStream.addTrack(track);
+      setMicrophoneTrack(track);
+      microphoneRecoveryBlockedRef.current = false;
+      microphoneRecoveryAttemptsRef.current = 0;
+      setIssues((current) => current.filter((issue) => issue.target !== "microphone"));
+      void refreshDevices().catch(() => undefined);
+    } catch (error) {
+      if (
+        recoveryRequestId !== microphoneRecoveryRequestIdRef.current
+        || captureRequestId !== captureRequestIdRef.current
+        || streamRef.current !== activeStream
+        || !captureMountedRef.current
+      ) {
+        return;
+      }
+
+      const message = getErrorMessage(error);
+      microphoneRecoveryBlockedRef.current = message.permissionDenied;
+      setIssues((current) => [
+        ...current.filter((issue) => issue.target !== "microphone"),
+        { target: "microphone", ...message },
+      ]);
+      microphoneRecoveryInFlightRef.current = false;
+      if (!message.permissionDenied) {
+        scheduleMicrophoneRecoveryRef.current();
+      }
+    } finally {
+      if (recoveryRequestId === microphoneRecoveryRequestIdRef.current) {
+        microphoneRecoveryInFlightRef.current = false;
+      }
+    }
+  }, [refreshDevices]);
+  recoverMicrophoneRef.current = recoverMicrophoneTrack;
 
   const requestSingleTrack = useCallback(async (kind: "camera" | "microphone", deviceId: string | null): Promise<MediaStreamTrack | null> => {
     const constraints: MediaStreamConstraints = kind === "camera"
@@ -832,7 +961,7 @@ export default function App() {
             return { track: requested.getVideoTracks()[0] ?? null };
           } catch (error) {
             const message = getErrorMessage(error);
-            const track = message.permissionDenied || !isCurrent() ? null : await requestSingleTrack("camera", null);
+            const track = message.permissionDenied || !isCurrent() || state.cameraId ? null : await requestSingleTrack("camera", null);
             return { track, ...(!track ? { issue: { target: "camera" as const, ...message } } : {}) };
           }
         })()
@@ -851,8 +980,10 @@ export default function App() {
         return { track: requested.getAudioTracks()[0] ?? null };
       } catch (error) {
         const message = getErrorMessage(error);
-        const track = message.permissionDenied || !isCurrent() ? null : await requestSingleTrack("microphone", null);
-        return { track, ...(!track ? { issue: { target: "microphone" as const, ...message } } : {}) };
+        return {
+          track: null,
+          ...(!isCurrent() ? {} : { issue: { target: "microphone" as const, ...message } }),
+        };
       }
     };
 
@@ -885,8 +1016,11 @@ export default function App() {
     }
 
     clearCaptureRecoveryTimer();
+    clearMicrophoneRecoveryTimer();
     if (!automaticRetry) {
       captureRetryAttemptsRef.current = 0;
+      microphoneRecoveryAttemptsRef.current = 0;
+      microphoneRecoveryBlockedRef.current = false;
     }
     const requestId = ++captureRequestIdRef.current;
     const nextState = { ...captureRef.current, ...overrides };
@@ -925,6 +1059,7 @@ export default function App() {
         }
       });
       setIssues(result.issues);
+      microphoneRecoveryBlockedRef.current = Boolean(result.issues.find((issue) => issue.target === "microphone")?.permissionDenied);
       const liveCameraTrack = result.stream.getVideoTracks().some((track) => track.readyState === "live");
       if (liveCameraTrack) {
         hasHadLiveCameraRef.current = true;
@@ -965,17 +1100,21 @@ export default function App() {
         if (track?.readyState === "live") {
           activeStream.addTrack(track);
           setMicrophoneTrack(track);
-          track.addEventListener("ended", () => {
-            setMicrophoneTrack((current) => current === track ? null : current);
-          }, { once: true });
+          microphoneRecoveryBlockedRef.current = false;
+          microphoneRecoveryAttemptsRef.current = 0;
         } else {
           setMicrophoneTrack(null);
         }
+
+        microphoneRecoveryBlockedRef.current = Boolean(issue?.permissionDenied);
 
         setIssues((current) => {
           const withoutMicrophoneIssue = current.filter((currentIssue) => currentIssue.target !== "microphone");
           return issue ? [...withoutMicrophoneIssue, issue] : withoutMicrophoneIssue;
         });
+        if (!track && !issue?.permissionDenied && captureRef.current.microphoneEnabled) {
+          scheduleMicrophoneRecoveryRef.current();
+        }
         });
       };
       const hasLiveCamera = result.stream.getVideoTracks().some((track) => track.readyState === "live");
@@ -1019,7 +1158,7 @@ export default function App() {
         setIsLoading(false);
       }
     }
-  }, [acquireCapture, clearCaptureRecoveryTimer, refreshDevices, stopStream]);
+  }, [acquireCapture, clearCaptureRecoveryTimer, clearMicrophoneRecoveryTimer, refreshDevices, stopStream]);
 
   const scheduleCaptureRecovery = useCallback((delay = CAPTURE_ENDED_RECOVERY_DELAY_MS) => {
     const state = captureRef.current;
@@ -1062,6 +1201,11 @@ export default function App() {
             clearCaptureRecoveryTimer();
             scheduleCaptureRecovery();
           }
+          const currentMicrophoneTrack = streamRef.current?.getAudioTracks().find((track) => track.readyState === "live");
+          if (!currentMicrophoneTrack && captureRef.current.microphoneEnabled && !microphoneRecoveryBlockedRef.current) {
+            microphoneRecoveryAttemptsRef.current = 0;
+            scheduleMicrophoneRecoveryRef.current();
+          }
         });
     };
     navigator.mediaDevices?.addEventListener("devicechange", handleDeviceChange);
@@ -1071,6 +1215,7 @@ export default function App() {
       captureRequestIdRef.current += 1;
       captureRestartingRef.current = false;
       clearCaptureRecoveryTimer();
+      clearMicrophoneRecoveryTimer();
       const currentStream = streamRef.current;
       streamRef.current = null;
       stopStream(currentStream);
@@ -1078,7 +1223,72 @@ export default function App() {
         window.clearTimeout(toastTimerRef.current);
       }
     };
-  }, [clearCaptureRecoveryTimer, refreshDevices, restartCapture, scheduleCaptureRecovery, stopStream]);
+  }, [clearCaptureRecoveryTimer, clearMicrophoneRecoveryTimer, refreshDevices, restartCapture, scheduleCaptureRecovery, stopStream]);
+
+  useEffect(() => {
+    if (!stream || !microphoneTrack) {
+      return;
+    }
+
+    const track = microphoneTrack;
+    const handleMicrophoneTrackEnded = () => {
+      if (
+        !captureMountedRef.current
+        || streamRef.current !== stream
+        || !captureRef.current.microphoneEnabled
+      ) {
+        return;
+      }
+
+      stream.removeTrack(track);
+      setMicrophoneTrack((current) => current === track ? null : current);
+      scheduleMicrophoneRecoveryRef.current();
+    };
+
+    const handleMicrophoneTrackMuted = () => {
+      if (
+        !captureMountedRef.current
+        || streamRef.current !== stream
+        || !captureRef.current.microphoneEnabled
+        || track.readyState !== "live"
+      ) {
+        return;
+      }
+
+      // A microphone can mute briefly while a device changes state. Give it a
+      // short grace period, then reacquire the explicitly selected device.
+      scheduleMicrophoneRecoveryRef.current(MICROPHONE_MUTED_RECOVERY_DELAY_MS);
+    };
+
+    const handleMicrophoneTrackUnmuted = () => {
+      if (
+        !captureMountedRef.current
+        || streamRef.current !== stream
+        || !captureRef.current.microphoneEnabled
+      ) {
+        return;
+      }
+
+      clearMicrophoneRecoveryTimer();
+      microphoneRecoveryAttemptsRef.current = 0;
+      microphoneRecoveryBlockedRef.current = false;
+      setIssues((current) => current.filter((issue) => issue.target !== "microphone"));
+    };
+
+    track.addEventListener("ended", handleMicrophoneTrackEnded);
+    track.addEventListener("mute", handleMicrophoneTrackMuted);
+    track.addEventListener("unmute", handleMicrophoneTrackUnmuted);
+    if (track.readyState === "ended") {
+      handleMicrophoneTrackEnded();
+    } else if (track.muted) {
+      handleMicrophoneTrackMuted();
+    }
+    return () => {
+      track.removeEventListener("ended", handleMicrophoneTrackEnded);
+      track.removeEventListener("mute", handleMicrophoneTrackMuted);
+      track.removeEventListener("unmute", handleMicrophoneTrackUnmuted);
+    };
+  }, [clearMicrophoneRecoveryTimer, microphoneTrack, stream]);
 
   useEffect(() => {
     if (!stream) {
@@ -1451,8 +1661,9 @@ export default function App() {
     window.setTimeout(() => setIsFlashVisible(false), 180);
 
     try {
-      const width = Math.max(640, Math.round(viewport.clientWidth * window.devicePixelRatio));
-      const height = Math.max(360, Math.round(viewport.clientHeight * window.devicePixelRatio));
+      const pixelRatio = window.devicePixelRatio || 1;
+      const width = Math.max(1, Math.round(viewport.clientWidth * pixelRatio));
+      const height = Math.max(1, Math.round(viewport.clientHeight * pixelRatio));
       const canvas = document.createElement("canvas");
       canvas.width = width;
       canvas.height = height;
@@ -1472,7 +1683,8 @@ export default function App() {
       const scale = baseScale * captureRef.current.zoom;
       const drawWidth = sourceWidth * scale;
       const drawHeight = sourceHeight * scale;
-      const drawX = (width - drawWidth) / 2 + (captureRef.current.panX / 100) * width;
+      const panX = (captureRef.current.panX / 100) * width;
+      const drawX = (width - drawWidth) / 2 + (captureRef.current.mirrored ? -panX : panX);
       const drawY = (height - drawHeight) / 2 + (captureRef.current.panY / 100) * height;
       context.save();
       if (captureRef.current.mirrored) {
@@ -1572,15 +1784,18 @@ export default function App() {
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       const element = event.target as HTMLElement;
-      if (["INPUT", "SELECT", "TEXTAREA"].includes(element.tagName)) {
-        return;
-      }
       if (event.key === "Escape" && isSettingsOpen) {
         setIsSettingsOpen(false);
         return;
       }
       if (event.key === "Escape" && isTransferOpen) {
         setIsTransferOpen(false);
+        return;
+      }
+      if (element.isContentEditable || ["INPUT", "SELECT", "TEXTAREA"].includes(element.tagName)) {
+        return;
+      }
+      if (isSettingsOpen || isTransferOpen || element.closest('[role="dialog"], [role="alertdialog"]')) {
         return;
       }
       if (event.key === " " || event.key.toLowerCase() === "p") {
@@ -1656,7 +1871,7 @@ export default function App() {
 
         <aside
           ref={dockPanelRef}
-          className={`control-panel action-panel ${dockSettings.collapsed ? "is-collapsed" : ""} ${isDockResizing ? "is-resizing" : ""}`}
+          className={`control-panel action-panel ${dockSettings.collapsed ? "is-collapsed" : ""} ${dockSettings.compactMode ? "is-compact" : ""} ${isDockResizing ? "is-resizing" : ""}`}
           style={({
             ...(dockSettings.height ? { "--dock-height": `${dockSettings.height}px`, "--dock-width": `${dockSettings.height}px` } : {}),
             "--dock-action-height": "42px",
@@ -1770,6 +1985,13 @@ export default function App() {
                       <Icon name="chevronDown" size={15} />
                     </span>
                   </label>
+                  <ToggleRow
+                    label={t("简洁模式")}
+                    detail={t("开启后控制栏会隐藏设备状态和辅助控件，仅保留拍照与缩放")}
+                    enabled={dockSettings.compactMode}
+                    icon="camera"
+                    onToggle={() => setDockSettings((current) => ({ ...current, compactMode: !current.compactMode, collapsed: false }))}
+                  />
                 </div>
                 <div className="setting-group snapshot-directory-setting">
                   <div className="settings-group-title">{t("照片保存位置")}</div>
